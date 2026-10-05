@@ -110,7 +110,7 @@ impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             max_connections: 10_000,
-            max_connections_per_ip: 8,
+            max_connections_per_ip: 32,
             max_rooms: 5_000,
             default_spectator_delay_ms: 3_000,
             messages_per_second: 20,
@@ -278,6 +278,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.server.region, "asia");
         assert_eq!(c.limits.max_connections, 10_000);
+        assert_eq!(c.limits.max_connections_per_ip, 32);
         assert_eq!(c.game.min_game_version, "0.4.1");
     }
 

@@ -12,6 +12,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use fighter_protocol::json as proto;
 use fighter_protocol::json::{parse_client_message, ClientParseError, ErrorCode, LeaveReason};
+use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 
@@ -60,6 +61,28 @@ pub async fn ws_handler(
         })
 }
 
+/// Read the first `hello`, skipping WebSocket control frames. Returns `None` on
+/// a non-hello text frame, a close, an error, or end of stream.
+async fn read_hello(stream: &mut SplitStream<WebSocket>) -> Option<proto::Hello> {
+    loop {
+        match stream.next().await {
+            Some(Ok(Message::Text(t))) => {
+                return match parse_client_message(t.as_str()) {
+                    Ok(proto::ClientEnvelope {
+                        msg: proto::ClientMessage::Hello(h),
+                        ..
+                    }) => Some(h),
+                    _ => None,
+                };
+            }
+            Some(Ok(Message::Ping(_)))
+            | Some(Ok(Message::Pong(_)))
+            | Some(Ok(Message::Binary(_))) => continue,
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return None,
+        }
+    }
+}
+
 async fn handle_socket(socket: WebSocket, state: AppState, ip: IpAddr) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<OutMsg>();
@@ -67,7 +90,10 @@ async fn handle_socket(socket: WebSocket, state: AppState, ip: IpAddr) {
 
     let writer_queued = queued_bytes.clone();
     let writer = tokio::spawn(async move {
-        let mut ping = tokio::time::interval(PING_INTERVAL);
+        // Delay the first keepalive ping by one period: an interval's first tick
+        // fires immediately, which would race the client's hello with its pong.
+        let mut ping =
+            tokio::time::interval_at(tokio::time::Instant::now() + PING_INTERVAL, PING_INTERVAL);
         ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -98,19 +124,11 @@ async fn handle_socket(socket: WebSocket, state: AppState, ip: IpAddr) {
         }
     });
 
-    // The first message must be `hello`, within 10 seconds.
-    let hello = match tokio::time::timeout(HELLO_TIMEOUT, stream.next()).await {
-        Ok(Some(Ok(Message::Text(t)))) => match parse_client_message(t.as_str()) {
-            Ok(proto::ClientEnvelope {
-                msg: proto::ClientMessage::Hello(h),
-                ..
-            }) => h,
-            _ => {
-                let _ = tx.send(OutMsg::Close(4000, "hello required".into()));
-                writer.await.ok();
-                return;
-            }
-        },
+    // The first `hello` must arrive within 10 seconds. Control frames (the
+    // client's automatic Pong, its Pings) may legitimately arrive first, so they
+    // are skipped rather than mistaken for the hello.
+    let hello = match tokio::time::timeout(HELLO_TIMEOUT, read_hello(&mut stream)).await {
+        Ok(Some(h)) => h,
         _ => {
             let _ = tx.send(OutMsg::Close(4000, "hello required".into()));
             writer.await.ok();
@@ -330,8 +348,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, ip: IpAddr) {
                     break;
                 }
             }
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
+                // Keepalive control frames count as activity, so a silent
+                // spectator or a feed-only host is not marked idle.
+                state
+                    .lobby
+                    .lock()
+                    .expect("lobby lock")
+                    .touch(&sid, state.clock.now_ms());
+            }
             Ok(Message::Close(_)) => break,
-            Ok(_) => {}
             Err(_) => break,
         }
     }

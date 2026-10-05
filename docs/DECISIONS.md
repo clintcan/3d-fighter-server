@@ -178,3 +178,29 @@ bottom.
 - **Quick-match rooms are public and allow spectators.** The first client in the
   queue becomes host, the second guest; pairing requires the same mode, region,
   game version and content hash.
+
+## Bug fixes (post-M5)
+
+- **The hello handshake skips WebSocket control frames.** A client's automatic
+  Pong (and any Ping) can arrive before its `hello`; `read_hello` ignores
+  Ping/Pong/Binary and only accepts a Text frame. The server's first keepalive
+  ping is also delayed by one period with `interval_at`, so it cannot race the
+  handshake. A non-hello Text frame still closes with 4000.
+- **Idle detection counts every frame, not just JSON.** `last_seen_ms` is
+  refreshed by `Lobby::touch` for Ping/Pong control frames and by
+  `handle_binary` for feed frames, so a silent spectator or a feed-only host is
+  not dropped after 45 s.
+- **`kick` invalidates the room's UDP bindings.** `handle_kick` calls
+  `bindings.unregister_room`, matching the leave/disconnect path, so a kicked
+  guest can no longer relay to the host.
+- **`spectate` enforces `game_version`/`content_hash`.** A spectator
+  re-simulates the match, so a mismatch is refused with `version_mismatch`, like
+  `join_room`.
+- **`rid` is echoed on every error and direct response.** All handlers take the
+  request id and pass it to `send_error`; `spectate_started` and the host's
+  `match_session` echo it too.
+- **`room_update` keeps `timer` when the field is omitted**, consistent with the
+  other optional fields.
+- **`max_connections_per_ip` defaults to 32** (was 8) because players behind
+  carrier-grade NAT or on one LAN share a public IP; documented in the example
+  config.

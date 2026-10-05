@@ -18,7 +18,9 @@ motd = "Welcome to 3D Fighter online!"
 
 [limits]
 max_connections = 10000
-max_connections_per_ip = 8
+# Players behind carrier-grade NAT, a LAN, or one household share a public IP.
+# Raise this if many of them connect from the same address.
+max_connections_per_ip = 32
 max_rooms = 5000
 default_spectator_delay_ms = 3000
 

@@ -309,6 +309,13 @@ impl Lobby {
         }
     }
 
+    /// Record any frame received from a client as activity (section 6.1).
+    pub fn touch(&mut self, sid: &str, now: u64) {
+        if let Some(sess) = self.sessions.get_mut(sid) {
+            sess.last_seen_ms = now;
+        }
+    }
+
     /// Adopt a disconnected session when a new connection presents its resume
     /// token. Returns the session id.
     pub fn try_resume(
@@ -586,43 +593,43 @@ impl Lobby {
                 ConnAction::None
             }
             proto::ClientMessage::CancelJoin(_) => {
-                self.handle_cancel_join(sid, ctx, now);
+                self.handle_cancel_join(sid, rid.as_deref(), ctx, now);
                 ConnAction::None
             }
             proto::ClientMessage::AnswerJoin(m) => {
-                self.handle_answer_join(sid, m, ctx, now);
+                self.handle_answer_join(sid, m, rid.as_deref(), ctx, now);
                 ConnAction::None
             }
             proto::ClientMessage::Kick(m) => {
-                self.handle_kick(sid, m, ctx, now);
+                self.handle_kick(sid, m, rid.as_deref(), ctx, now);
                 ConnAction::None
             }
             proto::ClientMessage::LeaveRoom(_) => {
-                self.handle_leave(sid, ctx, now);
+                self.handle_leave(sid, rid.as_deref(), ctx, now);
                 ConnAction::None
             }
             proto::ClientMessage::RoomUpdate(m) => {
-                self.handle_room_update(sid, m, ctx, now);
+                self.handle_room_update(sid, m, rid.as_deref(), ctx, now);
                 ConnAction::None
             }
             proto::ClientMessage::ConnectionReport(m) => {
-                self.handle_connection_report(sid, m, ctx, now);
+                self.handle_connection_report(sid, m, rid.as_deref(), ctx, now);
                 ConnAction::None
             }
             proto::ClientMessage::Spectate(m) => {
-                self.handle_spectate(sid, m, ctx, now);
+                self.handle_spectate(sid, m, rid.as_deref(), ctx, now);
                 ConnAction::None
             }
             proto::ClientMessage::StopSpectating(_) => {
-                self.handle_stop_spectating(sid, ctx, now);
+                self.handle_stop_spectating(sid, rid.as_deref(), ctx, now);
                 ConnAction::None
             }
             proto::ClientMessage::React(m) => {
-                self.handle_react(sid, m, ctx, now);
+                self.handle_react(sid, m, rid.as_deref(), ctx, now);
                 ConnAction::None
             }
             proto::ClientMessage::QueueJoin(m) => {
-                self.handle_queue_join(sid, m, ctx, now);
+                self.handle_queue_join(sid, m, rid.as_deref(), ctx, now);
                 ConnAction::None
             }
             proto::ClientMessage::QueueLeave(_) => {
@@ -982,10 +989,10 @@ impl Lobby {
         );
     }
 
-    fn handle_cancel_join(&mut self, sid: &str, ctx: &Ctx, now: u64) {
+    fn handle_cancel_join(&mut self, sid: &str, rid: Option<&str>, ctx: &Ctx, now: u64) {
         let room_id = self.find_pending_room_for_guest(sid);
         let Some(room_id) = room_id else {
-            self.send_error(sid, ErrorCode::NotAllowed, "no pending join", None);
+            self.send_error(sid, ErrorCode::NotAllowed, "no pending join", rid);
             return;
         };
         let host = self.rooms[&room_id].host.clone();
@@ -1011,20 +1018,27 @@ impl Lobby {
             .map(|r| r.id.clone())
     }
 
-    fn handle_answer_join(&mut self, sid: &str, m: AnswerJoin, ctx: &Ctx, now: u64) {
+    fn handle_answer_join(
+        &mut self,
+        sid: &str,
+        m: AnswerJoin,
+        rid: Option<&str>,
+        ctx: &Ctx,
+        now: u64,
+    ) {
         let Some(room_id) = self
             .rooms
             .values()
             .find(|r| r.host == sid)
             .map(|r| r.id.clone())
         else {
-            self.send_error(sid, ErrorCode::NotAllowed, "not a host", None);
+            self.send_error(sid, ErrorCode::NotAllowed, "not a host", rid);
             return;
         };
         let pending = match self.rooms[&room_id].pending.as_ref() {
             Some(p) if p.request_id == m.request_id => p,
             _ => {
-                self.send_error(sid, ErrorCode::NotAllowed, "no matching join request", None);
+                self.send_error(sid, ErrorCode::NotAllowed, "no matching join request", rid);
                 return;
             }
         };
@@ -1105,7 +1119,7 @@ impl Lobby {
             self.update_room_metrics(ctx.metrics);
 
             let udp = ctx.udp_info();
-            self.send(
+            self.send_rid(
                 &host,
                 &ServerMessage::MatchSession {
                     room_id: room_id.clone(),
@@ -1115,6 +1129,7 @@ impl Lobby {
                     peer: PeerInfo { name: guest_name },
                     udp: udp.clone(),
                 },
+                rid,
             );
             self.send(
                 &guest,
@@ -1155,19 +1170,19 @@ impl Lobby {
         self.broadcast_room_state(&room_id);
     }
 
-    fn handle_kick(&mut self, sid: &str, m: Kick, ctx: &Ctx, now: u64) {
+    fn handle_kick(&mut self, sid: &str, m: Kick, rid: Option<&str>, ctx: &Ctx, now: u64) {
         let Some(room_id) = self
             .rooms
             .values()
             .find(|r| r.host == sid)
             .map(|r| r.id.clone())
         else {
-            self.send_error(sid, ErrorCode::NotAllowed, "not a host", None);
+            self.send_error(sid, ErrorCode::NotAllowed, "not a host", rid);
             return;
         };
         let guest = self.rooms[&room_id].guest.clone();
         let Some(guest) = guest else {
-            self.send_error(sid, ErrorCode::NotAllowed, "no guest to kick", None);
+            self.send_error(sid, ErrorCode::NotAllowed, "no guest to kick", rid);
             return;
         };
         let reason = m
@@ -1180,6 +1195,9 @@ impl Lobby {
             room.phase = Phase::Lobby;
             room.touch(now);
         }
+        // Invalidate both players' UDP bindings; a new guest gets fresh slots on
+        // the next accept, and the kicked guest can no longer relay to the host.
+        self.bindings.unregister_room(&room_id);
         if let Some(g) = self.sessions.get_mut(&guest) {
             g.room = None;
             g.role = None;
@@ -1200,12 +1218,12 @@ impl Lobby {
         self.broadcast_room_state(&room_id);
     }
 
-    fn handle_leave(&mut self, sid: &str, ctx: &Ctx, now: u64) {
+    fn handle_leave(&mut self, sid: &str, rid: Option<&str>, ctx: &Ctx, now: u64) {
         let Some(sess) = self.sessions.get(sid) else {
             return;
         };
         let Some(room_id) = sess.room.clone() else {
-            self.send_error(sid, ErrorCode::NotAllowed, "not in a room", None);
+            self.send_error(sid, ErrorCode::NotAllowed, "not in a room", rid);
             return;
         };
         let role = sess.role.unwrap_or(Role::Spectator);
@@ -1216,14 +1234,21 @@ impl Lobby {
         }
     }
 
-    fn handle_room_update(&mut self, sid: &str, m: RoomUpdate, _ctx: &Ctx, now: u64) {
+    fn handle_room_update(
+        &mut self,
+        sid: &str,
+        m: RoomUpdate,
+        rid: Option<&str>,
+        _ctx: &Ctx,
+        now: u64,
+    ) {
         let Some(room_id) = self
             .rooms
             .values()
             .find(|r| r.host == sid)
             .map(|r| r.id.clone())
         else {
-            self.send_error(sid, ErrorCode::NotAllowed, "not a host", None);
+            self.send_error(sid, ErrorCode::NotAllowed, "not a host", rid);
             return;
         };
         let should_broadcast = {
@@ -1241,7 +1266,10 @@ impl Lobby {
             if let Some(w) = m.wins {
                 room.wins = w;
             }
-            room.timer = m.timer;
+            // Omitted optional fields keep their previous value, like the rest.
+            if m.timer.is_some() {
+                room.timer = m.timer;
+            }
             room.touch(now);
             if now >= room.next_broadcast_ms {
                 room.next_broadcast_ms = now + 250;
@@ -1257,9 +1285,16 @@ impl Lobby {
         }
     }
 
-    fn handle_connection_report(&mut self, sid: &str, m: ConnectionReport, _ctx: &Ctx, now: u64) {
+    fn handle_connection_report(
+        &mut self,
+        sid: &str,
+        m: ConnectionReport,
+        rid: Option<&str>,
+        _ctx: &Ctx,
+        now: u64,
+    ) {
         let Some(room_id) = self.sessions.get(sid).and_then(|s| s.room.clone()) else {
-            self.send_error(sid, ErrorCode::NotAllowed, "not in a room", None);
+            self.send_error(sid, ErrorCode::NotAllowed, "not in a room", rid);
             return;
         };
         if let Some(room) = self.rooms.get_mut(&room_id) {
@@ -1272,31 +1307,43 @@ impl Lobby {
         self.broadcast_room_state(&room_id);
     }
 
-    fn handle_spectate(&mut self, sid: &str, m: Spectate, ctx: &Ctx, now: u64) {
+    fn handle_spectate(&mut self, sid: &str, m: Spectate, rid: Option<&str>, ctx: &Ctx, now: u64) {
         let Some(sess) = self.sessions.get(sid) else {
             return;
         };
         if sess.room.is_some() {
-            self.send_error(sid, ErrorCode::AlreadyInRoom, "already in a room", None);
+            self.send_error(sid, ErrorCode::AlreadyInRoom, "already in a room", rid);
             return;
         }
+        let (viewer_version, viewer_hash) = (sess.game_version.clone(), sess.content_hash);
         let Some(room_id) = self.resolve_room(&m.room) else {
-            self.send_error(sid, ErrorCode::RoomNotFound, "room not found", None);
+            self.send_error(sid, ErrorCode::RoomNotFound, "room not found", rid);
             return;
         };
         {
             let room = &self.rooms[&room_id];
+            // A spectator re-simulates the match, so the build and data must
+            // match the room exactly (section 2).
+            if room.host_game_version != viewer_version || room.host_content_hash != viewer_hash {
+                self.send_error(
+                    sid,
+                    ErrorCode::VersionMismatch,
+                    "room needs a different game version or data",
+                    rid,
+                );
+                return;
+            }
             if !room.allow_spectators {
                 self.send_error(
                     sid,
                     ErrorCode::SpectatingDisabled,
                     "spectating disabled",
-                    None,
+                    rid,
                 );
                 return;
             }
             if room.spectators.len() >= room.max_spectators as usize {
-                self.send_error(sid, ErrorCode::SpectatorsFull, "spectators full", None);
+                self.send_error(sid, ErrorCode::SpectatorsFull, "spectators full", rid);
                 return;
             }
             if let Some(hash) = room.password_hash {
@@ -1306,7 +1353,7 @@ impl Lobby {
                     .map(|p| ct_eq(&hash_password(p), &hash))
                     .unwrap_or(false);
                 if !ok {
-                    self.send_error(sid, ErrorCode::WrongPassword, "wrong password", None);
+                    self.send_error(sid, ErrorCode::WrongPassword, "wrong password", rid);
                     return;
                 }
             }
@@ -1324,13 +1371,14 @@ impl Lobby {
             s.spectator = Some(SpectatorState::default());
         }
         ctx.metrics.spectators.inc();
-        self.send(
+        self.send_rid(
             sid,
             &ServerMessage::SpectateStarted {
                 room_id: room_id.clone(),
                 delay_ms: delay,
                 match_live: live,
             },
+            rid,
         );
         // Late join: send MATCH_START immediately, then the 20 ms flush task
         // streams the backlog from tick 0 and then live.
@@ -1344,24 +1392,24 @@ impl Lobby {
         self.broadcast_room_state(&room_id);
     }
 
-    fn handle_stop_spectating(&mut self, sid: &str, ctx: &Ctx, _now: u64) {
+    fn handle_stop_spectating(&mut self, sid: &str, rid: Option<&str>, ctx: &Ctx, _now: u64) {
         let Some(sess) = self.sessions.get(sid) else {
             return;
         };
         if sess.role != Some(Role::Spectator) {
-            self.send_error(sid, ErrorCode::NotAllowed, "not spectating", None);
+            self.send_error(sid, ErrorCode::NotAllowed, "not spectating", rid);
             return;
         }
         let room_id = sess.room.clone().expect("spectator has room");
         self.remove_spectator(&room_id, sid, ctx);
     }
 
-    fn handle_react(&mut self, sid: &str, m: proto::React, ctx: &Ctx, now: u64) {
+    fn handle_react(&mut self, sid: &str, m: proto::React, rid: Option<&str>, ctx: &Ctx, now: u64) {
         let Some(sess) = self.sessions.get(sid) else {
             return;
         };
         let Some(room_id) = sess.room.clone() else {
-            self.send_error(sid, ErrorCode::NotAllowed, "not in a room", None);
+            self.send_error(sid, ErrorCode::NotAllowed, "not in a room", rid);
             return;
         };
         let role = sess.role.unwrap_or(Role::Spectator);
@@ -1373,7 +1421,7 @@ impl Lobby {
             .unwrap_or(false);
         if !allowed {
             ctx.metrics.rate_limited.inc();
-            self.send_error(sid, ErrorCode::RateLimited, "too many reactions", None);
+            self.send_error(sid, ErrorCode::RateLimited, "too many reactions", rid);
             return;
         }
         self.broadcast_reaction(&room_id, role, &name, m.emote);
@@ -1381,12 +1429,19 @@ impl Lobby {
 
     // -- quick match (section 12, M5) -------------------------------------
 
-    fn handle_queue_join(&mut self, sid: &str, m: proto::QueueJoin, ctx: &Ctx, now: u64) {
+    fn handle_queue_join(
+        &mut self,
+        sid: &str,
+        m: proto::QueueJoin,
+        rid: Option<&str>,
+        ctx: &Ctx,
+        now: u64,
+    ) {
         let Some(sess) = self.sessions.get(sid) else {
             return;
         };
         if sess.room.is_some() {
-            self.send_error(sid, ErrorCode::AlreadyInRoom, "already in a room", None);
+            self.send_error(sid, ErrorCode::AlreadyInRoom, "already in a room", rid);
             return;
         }
         let region = m.region.unwrap_or_else(|| self.region.clone());
@@ -1900,6 +1955,9 @@ impl Lobby {
 
     /// Validate and store a binary feed frame published by the host.
     pub fn handle_binary(&mut self, sid: &str, payload: &[u8], ctx: &Ctx, now: u64) -> ConnAction {
+        // Binary frames are activity too: a host publishing the feed for a whole
+        // round must not be treated as idle.
+        self.touch(sid, now);
         let Some((room_id, is_host)) = self.rooms.values().find_map(|r| {
             if r.host == sid {
                 Some((r.id.clone(), true))
@@ -2551,5 +2609,103 @@ pub fn welcome_message(
         } else {
             None
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::replays::ReplayStore;
+    use fighter_protocol::clock::TestClock;
+    use std::path::PathBuf;
+
+    fn test_lobby() -> Lobby {
+        Lobby::new(
+            0,
+            "test".into(),
+            Bans::new(600_000, 86_400_000),
+            ReplayStore::new(PathBuf::from("target/test-replays"), false),
+        )
+    }
+
+    fn add_host(lobby: &mut Lobby, config: &Config, now: u64) {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let session = Session::new(
+            "s1".into(),
+            "cid".into(),
+            "Host".into(),
+            "0.4.1".into(),
+            111,
+            false,
+            None,
+            tx,
+            Arc::new(AtomicUsize::new(0)),
+            now,
+            config,
+        );
+        lobby.add_session(session);
+    }
+
+    // #6: room_update keeps the timer when the field is omitted.
+    #[test]
+    fn room_update_keeps_timer_when_omitted() {
+        let config = Config::default();
+        let metrics = Metrics::new();
+        let clock = TestClock::new(1_000);
+        let blocklist: Vec<String> = Vec::new();
+        let ctx = Ctx {
+            config: &config,
+            metrics: &metrics,
+            clock: &clock,
+            blocklist: &blocklist,
+        };
+        let mut lobby = test_lobby();
+        add_host(&mut lobby, &config, 1_000);
+        let (room_id, _code) = lobby.spawn_room(
+            "s1",
+            "Room".into(),
+            Visibility::Public,
+            None,
+            true,
+            3_000,
+            50,
+            &ctx,
+            1_000,
+        );
+        lobby.rooms.get_mut(&room_id).unwrap().timer = Some(5);
+
+        // An update that omits `timer` must not clear it.
+        lobby.handle_room_update(
+            "s1",
+            RoomUpdate {
+                phase: Phase::InMatch,
+                fighters: None,
+                stage: None,
+                round: Some(2),
+                wins: None,
+                timer: None,
+            },
+            None,
+            &ctx,
+            1_000,
+        );
+        assert_eq!(lobby.rooms[&room_id].timer, Some(5));
+
+        // Supplying `timer` still updates it.
+        lobby.handle_room_update(
+            "s1",
+            RoomUpdate {
+                phase: Phase::InMatch,
+                fighters: None,
+                stage: None,
+                round: None,
+                wins: None,
+                timer: Some(9),
+            },
+            None,
+            &ctx,
+            1_000,
+        );
+        assert_eq!(lobby.rooms[&room_id].timer, Some(9));
     }
 }

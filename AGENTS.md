@@ -37,7 +37,7 @@ You will not run the game, but these facts shape the protocol.
 | Version identity | `game_version` string (e.g. `"0.4.1"`) **and** `content_hash`, a u32 hash of all character and move data. Two clients can only play or watch together if both match exactly. The server must compare both. |
 | Match flow | Best of 3 rounds (up to 5 on draws), 99-second rounds, an intro of 110 ticks before each round. A full match is typically 1–4 minutes (3,600–14,400 ticks). |
 | State checksums | Every 60 ticks, each game hashes its confirmed state into a u32; peers compare them to detect desyncs. The host can include them in the spectator feed. |
-| Peer-to-peer protocol | UDP, default port 7777, NetPeer protocol version **3**. First byte of every datagram is a type in the range `0x01`–`0x33` (1, 10–16, 20, 21, 30, 40, 41, 50, 51). Datagrams are at most ~600 bytes (the largest is the handshake WELCOME carrying an RSA public key). The handshake includes a cookie challenge, an RSA-2048 key exchange and a 6-digit security code; after it, every datagram is AES-256-CBC + HMAC-SHA256. **The server relays these datagrams unchanged and must never parse them.** |
+| Peer-to-peer protocol | UDP, default port 7777, NetPeer protocol version **3**. First byte of every datagram is a type in the range `0x01`–`0x34` (1, 10–16, 20, 21, 30, 40, 41, 50, 51, 52; 52 is `T_PUNCH`, a tiny hole-punch datagram the server may relay like any other). Datagrams are at most ~600 bytes (the largest is the handshake WELCOME carrying an RSA public key). The handshake includes a cookie challenge, an RSA-2048 key exchange and a 6-digit security code; after it, every datagram is AES-256-CBC + HMAC-SHA256. **The server relays these datagrams unchanged and must never parse them.** |
 | Player names | 1–24 characters, with control, zero-width and bidirectional-override characters removed (see section 10.4). |
 
 All multi-byte integers in this document are **little-endian**, matching the game's `StreamPeerBuffer` default.
@@ -242,7 +242,7 @@ If a WebSocket drops, the server keeps the client's session (room membership, ro
 
 ## 7. Rendezvous and relay (UDP)
 
-One UDP socket, default port **7780**. Every datagram starts with a type byte in the range **`0xF0`–`0xF7`**, which never collides with game datagrams (`0x01`–`0x33`). The server **drops silently** anything malformed, unknown, unauthenticated or over a rate limit, and never sends a reply larger than the request (no amplification).
+One UDP socket, default port **7780**. Every datagram starts with a type byte in the range **`0xF0`–`0xF7`**, which never collides with game datagrams (`0x01`–`0x34`). The server **drops silently** anything malformed, unknown, unauthenticated or over a rate limit, and never sends a reply larger than the request (no amplification).
 
 ### 7.1 Datagram formats
 
@@ -310,7 +310,9 @@ Input values follow section 2: only bits 0–8 may be set, and the direction mus
 - When the match ends, spectators get `MATCH_END` after the delay and stay in the room for the next match. They can see `room_state` (results, rematch) in the meantime.
 
 ### 8.4 Integrity (milestone 5)
-The guest may also publish the same feed. If both are present, the server compares the inputs and checksums per tick. On disagreement it keeps forwarding the host's feed but marks the room `feed_verified: false` in `room_state` and increments a metric. This detects a tampered or desynced host feed without trusting either side.
+In an internet room **both players** publish the same feed, so verification is always active. The server compares the host's and guest's inputs and checksums per tick. On disagreement it keeps forwarding the host's feed but marks the room `feed_verified: false` in `room_state` and increments a metric. This detects a tampered or desynced host feed without trusting either side.
+
+The host sends `MATCH_END` once the result is confirmed (no rollback can change it). A player who leaves early sends `MATCH_END` with `result` 3 (aborted).
 
 ---
 
