@@ -1,0 +1,15 @@
+# Normalize line endings: store LF in the repository, check out LF everywhere.
+* text=auto eol=lf
+
+# Shell scripts must stay LF so they run under bash/WSL.
+*.sh text eol=lf
+
+# Windows batch files keep CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary-ish files that must never be normalized.
+*.png binary
+*.jpg binary
+*.replay binary
+*.db binary
