@@ -4,6 +4,9 @@ version = "0.0.0"
 publish = false
 edition = "2021"
 
+# Standalone: keep cargo-fuzz out of the parent workspace.
+[workspace]
+
 [package.metadata]
 cargo-fuzz = true
 
