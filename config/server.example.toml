@@ -1,0 +1,43 @@
+[server]
+region = "asia"
+http_bind = "0.0.0.0:8080"     # WebSocket + HTTP; put TLS in front (Caddy/nginx) or set [tls]
+udp_bind = "0.0.0.0:7780"
+public_udp_host = "fighter-asia.example.com"   # what clients are told in welcome.udp
+log_format = "json"            # or "pretty"
+log_ips = false
+
+[tls]                          # optional: terminate TLS in-process
+# cert = "/etc/fighter/cert.pem"
+# key = "/etc/fighter/key.pem"
+
+[game]
+min_game_version = "0.4.1"     # older clients are refused
+latest_game_version = "0.4.1"  # newer releases trigger an update prompt
+update_url = "https://github.com/clintcan/3d-fighter/releases/latest"
+motd = "Welcome to 3D Fighter online!"
+
+[limits]
+max_connections = 10000
+max_connections_per_ip = 8
+max_rooms = 5000
+default_spectator_delay_ms = 3000
+
+[admin]
+token_env = "FIGHTER_ADMIN_TOKEN"   # admin API enabled only if this variable is set
+# token = "..."                     # optional inline override (tests)
+
+[moderation]
+blocklist = []                      # rejected name/room-name words
+
+[storage]                      # milestone 5
+replays = true
+database = "/var/lib/fighter/fighter.db"
+replay_dir = "/var/lib/fighter/replays"
+replay_retention_days = 7
+
+# Region discovery (`GET /v1/regions`). Leave empty to advertise this server.
+[[regions]]
+region = "asia"
+ws_url = "wss://fighter-asia.example.com/v1/ws"
+udp_host = "fighter-asia.example.com"
+udp_port = 7780

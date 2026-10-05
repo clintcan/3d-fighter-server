@@ -1,0 +1,40 @@
+[package]
+name = "fighter-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+fighter-protocol = { path = "../crates/protocol" }
+
+[[bin]]
+name = "json_message"
+path = "fuzz_targets/json_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "binary_frame"
+path = "fuzz_targets/binary_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "udp_datagram"
+path = "fuzz_targets/udp_datagram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "text_name"
+path = "fuzz_targets/text_name.rs"
+test = false
+doc = false
+bench = false
