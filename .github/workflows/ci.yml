@@ -13,7 +13,8 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # Ubuntu 24.04 LTS: pinned so CI does not drift with the ubuntu-latest label.
+    runs-on: ubuntu-24.04
     env:
       RUSTFLAGS: -D warnings
     steps:
@@ -35,7 +36,7 @@ jobs:
           cargo audit
 
   fuzz:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b # stable
