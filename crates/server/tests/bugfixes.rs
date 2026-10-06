@@ -397,3 +397,31 @@ async fn partial_http_request_is_timed_out() {
     assert_eq!(status, 200);
     let _ = Client::connect(&running.ws_url(), "A", "0.4.1", 111).await;
 }
+
+// #14: cleartext HTTP/2 (h2c) is refused; only HTTP/1 is served.
+#[tokio::test]
+async fn http2_prior_knowledge_is_refused() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (running, _clock) = start_test().await;
+    let mut stream = tokio::net::TcpStream::connect(running.addr).await.unwrap();
+    // HTTP/2 connection preface followed by an empty SETTINGS frame.
+    let mut req = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+    req.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+    stream.write_all(&req).await.unwrap();
+
+    let mut buf = [0u8; 256];
+    match timeout(Duration::from_secs(2), stream.read(&mut buf)).await {
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => {
+            let text = String::from_utf8_lossy(&buf[..n]);
+            assert!(!text.contains("200 OK"), "h2c should not be served: {text}");
+        }
+        Ok(Err(_)) | Err(_) => {}
+    }
+
+    // HTTP/1 requests and WebSocket upgrades still work.
+    let (status, _) = http_request(running.addr, "GET", "/healthz", &[], "").await;
+    assert_eq!(status, 200);
+    let _ = Client::connect(&running.ws_url(), "A", "0.4.1", 111).await;
+}

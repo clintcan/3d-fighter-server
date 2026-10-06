@@ -238,7 +238,10 @@ bottom.
   before any request is read, so incomplete requests count too. Replay files are
   streamed, the replay list is kept sorted, and `/metrics` requires the admin
   token when one is configured. A proxy is still recommended for TLS (and it can
-  enforce its own header timeout as well).
+  enforce its own header timeout as well). The builder is **HTTP/1 only**: nothing
+  needs HTTP/2, and cleartext h2c would bypass the HTTP/1 header-read timeout. The
+  accept loop backs off (100 ms doubling to 1 s) after an accept error such as
+  `EMFILE`, instead of spinning.
 - **Bindings live behind their own lock.** The UDP task decodes before taking any
   lock; RELAY and PING touch only `Bindings`, and only BIND takes the lobby lock,
   briefly, to notify peers. The lock order is always lobby -> bindings. Per-source

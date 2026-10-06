@@ -69,8 +69,10 @@ pub async fn start(config: Config, clock: Arc<dyn Clock>) -> Result<Running> {
 
         // Serve with hyper-util so we can set a header-read timeout (issue #13).
         // `axum::serve` does not expose hyper's `header_read_timeout`.
+        // HTTP/1 only: nothing needs HTTP/2, and the header-read timeout is an
+        // HTTP/1 setting, so cleartext h2c would bypass it (issue #14).
         let mut make_service = router.into_make_service_with_connect_info::<SocketAddr>();
-        let mut builder = HyperBuilder::new(TokioExecutor::new());
+        let mut builder = HyperBuilder::new(TokioExecutor::new()).http1_only();
         builder
             .http1()
             .timer(TokioTimer::new())
@@ -81,13 +83,28 @@ pub async fn start(config: Config, clock: Arc<dyn Clock>) -> Result<Running> {
         let shutdown = shutdown(task_state.clone());
         tokio::pin!(shutdown);
 
+        // Back off after accept errors (for example EMFILE) instead of spinning.
+        let mut accept_backoff = Duration::ZERO;
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
                     let (stream, remote) = match accepted {
-                        Ok(v) => v,
+                        Ok(v) => {
+                            accept_backoff = Duration::ZERO;
+                            v
+                        }
                         Err(e) => {
-                            tracing::warn!(error = %e, "accept error");
+                            if accept_backoff.is_zero() {
+                                tracing::warn!(error = %e, "accept error; backing off");
+                            } else {
+                                tracing::debug!(error = %e, "accept error");
+                            }
+                            accept_backoff = if accept_backoff.is_zero() {
+                                Duration::from_millis(100)
+                            } else {
+                                (accept_backoff * 2).min(Duration::from_secs(1))
+                            };
+                            tokio::time::sleep(accept_backoff).await;
                             continue;
                         }
                     };
