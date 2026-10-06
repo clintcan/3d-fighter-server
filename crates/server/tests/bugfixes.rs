@@ -5,7 +5,7 @@ mod common;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use common::{pair_up, start_test, start_with, test_config, Client, Ws};
+use common::{http_request, pair_up, start_test, start_with, test_config, Client, Ws};
 use fighter_protocol::feed::{FeedFrame, MatchStart};
 use fighter_protocol::udp::{BindRole, UdpDatagram};
 use futures_util::{SinkExt, StreamExt};
@@ -359,4 +359,41 @@ async fn trusted_proxy_bans_per_forwarded_address() {
     // ...but a different forwarded address is not.
     let mut b = Client::hello_raw_with(&url, hello("b"), &[("x-forwarded-for", "5.6.7.8")]).await;
     assert_eq!(b.recv().await["type"], "welcome");
+}
+
+// #13: a slow, incomplete request is closed by the header-read timeout.
+#[tokio::test]
+async fn partial_http_request_is_timed_out() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut config = test_config();
+    config.limits.http_header_timeout_ms = 300;
+    let (running, _clock) = start_with(config).await;
+
+    // Send a partial request and stop; the server must close the connection.
+    let mut stream = tokio::net::TcpStream::connect(running.addr).await.unwrap();
+    stream
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n")
+        .await
+        .unwrap();
+    let closed = timeout(Duration::from_secs(3), async {
+        let mut buf = [0u8; 64];
+        loop {
+            match stream.read(&mut buf).await {
+                Ok(0) | Err(_) => return true,
+                Ok(_) => continue,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        closed,
+        "incomplete request should be closed by the header timeout"
+    );
+
+    // Normal HTTP and WebSocket upgrades still work.
+    let (status, _) = http_request(running.addr, "GET", "/healthz", &[], "").await;
+    assert_eq!(status, 200);
+    let _ = Client::connect(&running.ws_url(), "A", "0.4.1", 111).await;
 }

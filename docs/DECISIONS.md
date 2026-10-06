@@ -229,11 +229,16 @@ bottom.
   writes on a blocking thread and appends to a sorted in-memory index. The store
   enforces `max_replays` and `max_replay_bytes`, evicting the oldest first, and
   only stores matches of at least 60 ticks at most once per second per room.
-- **HTTP has timeouts and a concurrency cap.** `TimeoutLayer` bounds request
-  handling and `ConcurrencyLimitLayer` bounds in-flight requests. Replay files are
+- **HTTP has timeouts, a concurrency cap and a header-read timeout.** The server is
+  served through `hyper-util` instead of `axum::serve` so it can set
+  `http1::Builder::header_read_timeout` (default 10 s, `http_header_timeout_ms`),
+  which closes slow/incomplete requests that never finish their headers. A
+  `TimeoutLayer` bounds request handling, `ConcurrencyLimitLayer` bounds in-flight
+  requests, and a semaphore caps raw TCP connections (`max_http_connections`)
+  before any request is read, so incomplete requests count too. Replay files are
   streamed, the replay list is kept sorted, and `/metrics` requires the admin
-  token when one is configured. Header-read (slowloris) timeouts are left to the
-  fronting proxy; `axum::serve` does not expose hyper's header timeout.
+  token when one is configured. A proxy is still recommended for TLS (and it can
+  enforce its own header timeout as well).
 - **Bindings live behind their own lock.** The UDP task decodes before taking any
   lock; RELAY and PING touch only `Bindings`, and only BIND takes the lobby lock,
   briefly, to notify peers. The lock order is always lobby -> bindings. Per-source

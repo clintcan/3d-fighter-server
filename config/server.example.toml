@@ -34,6 +34,9 @@ max_match_log_bytes = 268435456
 # Replay store quotas (oldest evicted first).
 max_replays = 1000
 max_replay_bytes = 536870912
+# HTTP: close slow/incomplete requests and bound raw connections.
+http_header_timeout_ms = 10000
+max_http_connections = 10000
 
 [admin]
 token_env = "FIGHTER_ADMIN_TOKEN"   # admin API enabled only if this variable is set

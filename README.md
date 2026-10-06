@@ -83,6 +83,11 @@ Every setting can be overridden by an environment variable named
 
 It listens for WebSocket + HTTP on `server.http_bind` (default
 `0.0.0.0:8080`). Put TLS in front (Caddy/nginx) or configure `[tls]` later.
+The server enforces HTTP header-read timeouts (`http_header_timeout_ms`, default
+10 s) and caps raw TCP connections (`max_http_connections`), so incomplete
+requests cannot pile up; a proxy is still recommended for TLS. When TLS
+terminates at a proxy, list it in `server.trusted_proxies` so bans and per-IP
+limits see the real client.
 The UDP listener (rendezvous, relay, ping) binds `server.udp_bind` (default
 `0.0.0.0:7780`); clients are told `server.public_udp_host` and that port in
 `welcome.udp`.

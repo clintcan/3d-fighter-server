@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use fighter_protocol::clock::Clock;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 use crate::config::Config;
 use crate::lobby::{Ctx, Lobby};
@@ -30,6 +30,8 @@ pub struct AppState {
     /// UDP rendezvous/relay state, behind its own lock so the relay path never
     /// contends with the lobby (issue #11).
     pub bindings: Arc<Mutex<Bindings>>,
+    /// Bounds raw TCP connections before any request is read (issue #13).
+    pub http_semaphore: Arc<Semaphore>,
     pub shutting_down: Arc<AtomicBool>,
     pub rooms_cache: Arc<Mutex<Option<(u64, String)>>>,
     conn_total: Arc<AtomicUsize>,
@@ -51,6 +53,7 @@ impl AppState {
         let (replay_tx, replay_rx) = mpsc::unbounded_channel::<ReplayJob>();
         let trusted_proxies = Arc::new(parse_trusted(&config.server.trusted_proxies));
         let bindings = Arc::new(Mutex::new(Bindings::default()));
+        let http_semaphore = Arc::new(Semaphore::new(config.limits.max_http_connections));
         let admin_token = config
             .admin
             .token
@@ -74,6 +77,7 @@ impl AppState {
             trusted_proxies,
             replays,
             bindings,
+            http_semaphore,
             shutting_down: Arc::new(AtomicBool::new(false)),
             rooms_cache: Arc::new(Mutex::new(None)),
             conn_total: Arc::new(AtomicUsize::new(0)),
@@ -85,6 +89,12 @@ impl AppState {
     /// Take the replay writer receiver once, so `serve` can spawn the writer.
     pub fn take_replay_receiver(&self) -> Option<mpsc::UnboundedReceiver<ReplayJob>> {
         self.replay_rx.lock().expect("replay rx").take()
+    }
+
+    /// Reserve a raw TCP connection slot (issue #13). The permit is held for the
+    /// life of the connection, so incomplete requests count too.
+    pub fn try_acquire_http(&self) -> Option<OwnedSemaphorePermit> {
+        self.http_semaphore.clone().try_acquire_owned().ok()
     }
 
     /// Borrowed handler context.

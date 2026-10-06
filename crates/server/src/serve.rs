@@ -6,10 +6,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
+use axum::extract::Request;
 use fighter_protocol::clock::Clock;
 use fighter_protocol::json::Severity;
+use hyper::body::Incoming;
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
+use hyper_util::server::conn::auto::Builder as HyperBuilder;
+use hyper_util::server::graceful::GracefulShutdown;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tower::{Service, ServiceExt};
 
 use crate::app::AppState;
 use crate::config::Config;
@@ -60,11 +66,74 @@ pub async fn start(config: Config, clock: Arc<dyn Clock>) -> Result<Running> {
     let handle = tokio::spawn(async move {
         let janitor = tokio::spawn(janitor(task_state.clone()));
         let spectate = tokio::spawn(spectate_tick(task_state.clone()));
-        let _ = axum::serve(
-            listener,
-            router.into_make_service_with_connect_info::<SocketAddr>(),
+
+        // Serve with hyper-util so we can set a header-read timeout (issue #13).
+        // `axum::serve` does not expose hyper's `header_read_timeout`.
+        let mut make_service = router.into_make_service_with_connect_info::<SocketAddr>();
+        let mut builder = HyperBuilder::new(TokioExecutor::new());
+        builder
+            .http1()
+            .timer(TokioTimer::new())
+            .header_read_timeout(Duration::from_millis(
+                task_state.config.limits.http_header_timeout_ms,
+            ));
+        let graceful = GracefulShutdown::new();
+        let shutdown = shutdown(task_state.clone());
+        tokio::pin!(shutdown);
+
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (stream, remote) = match accepted {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "accept error");
+                            continue;
+                        }
+                    };
+                    // Bound raw connections before any request is read.
+                    let permit = match task_state.try_acquire_http() {
+                        Some(p) => p,
+                        None => {
+                            task_state
+                                .metrics
+                                .connections_rejected
+                                .with_label_values(&["raw"])
+                                .inc();
+                            drop(stream);
+                            continue;
+                        }
+                    };
+                    let tower_service = match make_service.call(remote).await {
+                        Ok(s) => s,
+                        Err(infallible) => match infallible {},
+                    };
+                    let builder = builder.clone();
+                    let watcher = graceful.watcher();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let io = TokioIo::new(stream);
+                        let hyper_service = hyper::service::service_fn(
+                            move |request: Request<Incoming>| {
+                                tower_service.clone().oneshot(request)
+                            },
+                        );
+                        let conn = builder.serve_connection_with_upgrades(io, hyper_service);
+                        let conn = watcher.watch(conn.into_owned());
+                        if let Err(e) = conn.await {
+                            tracing::debug!(error = %e, "connection error");
+                        }
+                    });
+                }
+                _ = &mut shutdown => break,
+            }
+        }
+        drop(listener);
+        // Let in-flight connections finish, bounded by the shutdown grace.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(task_state.config.limits.shutdown_grace_ms),
+            graceful.shutdown(),
         )
-        .with_graceful_shutdown(shutdown(task_state))
         .await;
         janitor.abort();
         spectate.abort();
