@@ -520,6 +520,9 @@ pub enum ServerMessage {
         role: Role,
         session_token: String,
         relay_key: String,
+        /// 32 hex characters (16 random bytes): a per-match shared secret the
+        /// host can use to verify the guest on the direct path.
+        pair_secret: String,
         peer: PeerInfo,
         udp: UdpInfo,
     },

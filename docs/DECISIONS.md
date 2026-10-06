@@ -238,10 +238,12 @@ bottom.
   before any request is read, so incomplete requests count too. Replay files are
   streamed, the replay list is kept sorted, and `/metrics` requires the admin
   token when one is configured. A proxy is still recommended for TLS (and it can
-  enforce its own header timeout as well). The builder is **HTTP/1 only**: nothing
-  needs HTTP/2, and cleartext h2c would bypass the HTTP/1 header-read timeout. The
-  accept loop backs off (100 ms doubling to 1 s) after an accept error such as
-  `EMFILE`, instead of spinning.
+  enforce its own header timeout as well). The server is served with hyper's
+  `http1::Builder` directly (not the hyper-util auto builder, whose
+  `serve_connection_with_upgrades` ignores `http1_only()` and would still serve
+  cleartext HTTP/2, bypassing the header-read timeout). The accept loop backs off
+  (100 ms doubling to 1 s) after an accept error such as `EMFILE`, instead of
+  spinning, and drains in-flight connections on shutdown bounded by the grace.
 - **Bindings live behind their own lock.** The UDP task decodes before taking any
   lock; RELAY and PING touch only `Bindings`, and only BIND takes the lobby lock,
   briefly, to notify peers. The lock order is always lobby -> bindings. Per-source
@@ -251,3 +253,10 @@ bottom.
   for reconnection are included in the total and per-IP connection counts, and a
   client may keep at most `max_lingering_sessions_per_client` (default 3); older
   ones are dropped when it connects again without a resume token.
+- **`match_session` carries a per-match `pair_secret`.** 16 random bytes, 32 hex
+  characters, generated when a join is accepted or a quick match is formed, stored
+  on the room, and sent to both players. It lets the host verify the guest on the
+  direct path (an HMAC of the guest's HELLO nonce) so a different client behind
+  the same public IP cannot win the race. It is never logged or placed in
+  `room_state`, `peer_endpoints` or metrics, and is cleared when the guest leaves
+  so the next match gets a fresh one.

@@ -410,12 +410,18 @@ async fn http2_prior_knowledge_is_refused() {
     req.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
     stream.write_all(&req).await.unwrap();
 
+    // A served HTTP/2 connection answers with a binary SETTINGS frame (9-byte
+    // header, byte 3 = frame type 0x04). An HTTP/1-only server answers with an
+    // HTTP/1 status line or closes.
     let mut buf = [0u8; 256];
     match timeout(Duration::from_secs(2), stream.read(&mut buf)).await {
         Ok(Ok(0)) => {}
         Ok(Ok(n)) => {
-            let text = String::from_utf8_lossy(&buf[..n]);
-            assert!(!text.contains("200 OK"), "h2c should not be served: {text}");
+            assert!(
+                buf[..n].starts_with(b"HTTP/1.1"),
+                "expected an HTTP/1 rejection or close, got: {:02x?}",
+                &buf[..n.min(24)]
+            );
         }
         Ok(Err(_)) | Err(_) => {}
     }
@@ -424,4 +430,44 @@ async fn http2_prior_knowledge_is_refused() {
     let (status, _) = http_request(running.addr, "GET", "/healthz", &[], "").await;
     assert_eq!(status, 200);
     let _ = Client::connect(&running.ws_url(), "A", "0.4.1", 111).await;
+}
+
+// #16: match_session carries one shared pair_secret, different per match.
+async fn matched_pair_secrets(url: &str) -> (String, String) {
+    let mut host = Client::connect(url, "H", "0.4.1", 111).await;
+    host.send(json!({"type":"create_room","visibility":"public","allow_spectators":true}))
+        .await;
+    let code = host.recv_type("room_created").await["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut guest = Client::connect(url, "G", "0.4.1", 111).await;
+    guest.send(json!({"type":"join_room","room":code})).await;
+    guest.recv_type("join_pending").await;
+    let request = host.recv_type("join_request").await;
+    host.send(json!({
+        "type":"answer_join","request_id":request["request_id"],"accept":true
+    }))
+    .await;
+    let host_session = host.recv_type("match_session").await;
+    let guest_session = guest.recv_type("match_session").await;
+    (
+        host_session["pair_secret"].as_str().unwrap().to_string(),
+        guest_session["pair_secret"].as_str().unwrap().to_string(),
+    )
+}
+
+#[tokio::test]
+async fn match_session_carries_a_shared_pair_secret() {
+    let (running, _clock) = start_test().await;
+    let url = running.ws_url();
+
+    let (host_secret, guest_secret) = matched_pair_secrets(&url).await;
+    assert_eq!(host_secret.len(), 32);
+    assert!(host_secret.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_eq!(host_secret, guest_secret, "both players share the secret");
+
+    let (host2, guest2) = matched_pair_secrets(&url).await;
+    assert_eq!(host2, guest2);
+    assert_ne!(host_secret, host2, "a new match has a new secret");
 }

@@ -10,9 +10,7 @@ use axum::extract::Request;
 use fighter_protocol::clock::Clock;
 use fighter_protocol::json::Severity;
 use hyper::body::Incoming;
-use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
-use hyper_util::server::conn::auto::Builder as HyperBuilder;
-use hyper_util::server::graceful::GracefulShutdown;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tower::{Service, ServiceExt};
@@ -67,19 +65,19 @@ pub async fn start(config: Config, clock: Arc<dyn Clock>) -> Result<Running> {
         let janitor = tokio::spawn(janitor(task_state.clone()));
         let spectate = tokio::spawn(spectate_tick(task_state.clone()));
 
-        // Serve with hyper-util so we can set a header-read timeout (issue #13).
-        // `axum::serve` does not expose hyper's `header_read_timeout`.
-        // HTTP/1 only: nothing needs HTTP/2, and the header-read timeout is an
-        // HTTP/1 setting, so cleartext h2c would bypass it (issue #14).
+        // Serve with hyper's HTTP/1 builder directly (issue #13/#14). The
+        // hyper-util auto builder always does version detection in
+        // `serve_connection_with_upgrades` and would still serve cleartext
+        // HTTP/2, where the header-read timeout does not apply. HTTP/1 is all we
+        // need: the WebSocket upgrade is HTTP/1.1 and the JSON endpoints are tiny.
         let mut make_service = router.into_make_service_with_connect_info::<SocketAddr>();
-        let mut builder = HyperBuilder::new(TokioExecutor::new()).http1_only();
-        builder
-            .http1()
+        let mut http1 = hyper::server::conn::http1::Builder::new();
+        http1
             .timer(TokioTimer::new())
             .header_read_timeout(Duration::from_millis(
                 task_state.config.limits.http_header_timeout_ms,
             ));
-        let graceful = GracefulShutdown::new();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let shutdown = shutdown(task_state.clone());
         tokio::pin!(shutdown);
 
@@ -125,8 +123,9 @@ pub async fn start(config: Config, clock: Arc<dyn Clock>) -> Result<Running> {
                         Ok(s) => s,
                         Err(infallible) => match infallible {},
                     };
-                    let builder = builder.clone();
-                    let watcher = graceful.watcher();
+                    let http1 = http1.clone();
+                    active.fetch_add(1, Ordering::SeqCst);
+                    let active = active.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
                         let io = TokioIo::new(stream);
@@ -135,11 +134,11 @@ pub async fn start(config: Config, clock: Arc<dyn Clock>) -> Result<Running> {
                                 tower_service.clone().oneshot(request)
                             },
                         );
-                        let conn = builder.serve_connection_with_upgrades(io, hyper_service);
-                        let conn = watcher.watch(conn.into_owned());
+                        let conn = http1.serve_connection(io, hyper_service).with_upgrades();
                         if let Err(e) = conn.await {
                             tracing::debug!(error = %e, "connection error");
                         }
+                        active.fetch_sub(1, Ordering::SeqCst);
                     });
                 }
                 _ = &mut shutdown => break,
@@ -147,11 +146,11 @@ pub async fn start(config: Config, clock: Arc<dyn Clock>) -> Result<Running> {
         }
         drop(listener);
         // Let in-flight connections finish, bounded by the shutdown grace.
-        let _ = tokio::time::timeout(
-            Duration::from_millis(task_state.config.limits.shutdown_grace_ms),
-            graceful.shutdown(),
-        )
-        .await;
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(task_state.config.limits.shutdown_grace_ms);
+        while active.load(Ordering::SeqCst) > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         janitor.abort();
         spectate.abort();
     });

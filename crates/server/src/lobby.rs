@@ -203,6 +203,9 @@ pub struct Room {
     pub last_activity_ms: u64,
     pub host_game_version: String,
     pub host_content_hash: u32,
+    /// Per-match shared secret sent in `match_session`; never logged or exposed
+    /// anywhere else.
+    pub pair_secret: Option<String>,
     pub decline_cooldowns: HashMap<String, u64>,
     pub log: MatchLog,
     /// Guest's copy of the feed, used for M5 verification.
@@ -909,6 +912,7 @@ impl Lobby {
             last_activity_ms: now,
             host_game_version: game_version,
             host_content_hash: content_hash,
+            pair_secret: None,
             decline_cooldowns: HashMap::new(),
             log: MatchLog::default(),
             guest_log: MatchLog::default(),
@@ -1101,6 +1105,9 @@ impl Lobby {
             let room = self.rooms.get_mut(&room_id).expect("room exists");
             room.pending = None;
             room.guest = Some(guest.clone());
+            // A fresh per-match secret for the direct-path guest check (issue #16).
+            let pair_secret = generate_hex_token(16);
+            room.pair_secret = Some(pair_secret.clone());
             room.touch(now);
             let host = room.host.clone();
 
@@ -1178,6 +1185,7 @@ impl Lobby {
                     role: Role::Host,
                     session_token: host_token,
                     relay_key: host_relay,
+                    pair_secret: pair_secret.clone(),
                     peer: PeerInfo { name: guest_name },
                     udp: udp.clone(),
                 },
@@ -1190,6 +1198,7 @@ impl Lobby {
                     role: Role::Guest,
                     session_token: guest_token,
                     relay_key: guest_relay,
+                    pair_secret,
                     peer: PeerInfo { name: host_name },
                     udp,
                 },
@@ -1631,6 +1640,10 @@ impl Lobby {
             );
             ctx.metrics.joins.with_label_values(&["quick_match"]).inc();
             self.update_room_metrics(ctx.metrics);
+            let pair_secret = generate_hex_token(16);
+            if let Some(room) = self.rooms.get_mut(&room_id) {
+                room.pair_secret = Some(pair_secret.clone());
+            }
             self.send(
                 &host,
                 &ServerMessage::QueueMatched {
@@ -1650,6 +1663,7 @@ impl Lobby {
                     role: Role::Host,
                     session_token: host_token,
                     relay_key: host_relay,
+                    pair_secret: pair_secret.clone(),
                     peer: PeerInfo { name: guest_name },
                     udp: host_udp.clone(),
                 },
@@ -1661,6 +1675,7 @@ impl Lobby {
                     role: Role::Guest,
                     session_token: guest_token,
                     relay_key: guest_relay,
+                    pair_secret,
                     peer: PeerInfo {
                         name: self
                             .sessions
@@ -1693,6 +1708,7 @@ impl Lobby {
         }
         room.guest = None;
         room.phase = Phase::Lobby;
+        room.pair_secret = None;
         room.touch(now);
         // The match is over; free its logs.
         self.log_bytes = self.log_bytes.saturating_sub(room_log_bytes(room));
