@@ -27,6 +27,8 @@ pub struct MatchLog {
     batches: Vec<Batch>,
     pub checksums: Vec<(u32, u32, u64)>,
     pub end: Option<(MatchEnd, u64)>,
+    /// Server time when this match began, for the real-time feed limit.
+    pub started_ms: u64,
 }
 
 impl MatchLog {
@@ -38,14 +40,33 @@ impl MatchLog {
         self.inputs.len()
     }
 
+    /// Approximate heap use, for the global match-log budget.
+    pub fn byte_size(&self) -> usize {
+        let strings = self
+            .start
+            .as_ref()
+            .map(|m| {
+                m.game_version.len()
+                    + m.stage_id.len()
+                    + m.p1_fighter_id.len()
+                    + m.p2_fighter_id.len()
+                    + m.p1_name.len()
+                    + m.p2_name.len()
+                    + 16
+            })
+            .unwrap_or(0);
+        self.inputs.len() * 4 + self.checksums.len() * 12 + strings + 64
+    }
+
     /// Begin a new match, discarding any previous log.
-    pub fn begin(&mut self, start: MatchStart) {
+    pub fn begin(&mut self, start: MatchStart, now: u64) {
         self.match_id = Some(start.match_id);
         self.start = Some(start);
         self.inputs.clear();
         self.batches.clear();
         self.checksums.clear();
         self.end = None;
+        self.started_ms = now;
     }
 
     /// Discard the log (a feed gap or reset).
@@ -127,7 +148,7 @@ mod tests {
     #[test]
     fn visible_ticks_respects_delay() {
         let mut log = MatchLog::default();
-        log.begin(start());
+        log.begin(start(), 0);
         log.push_inputs(&[(5, 5); 6], 1000);
         log.push_inputs(&[(5, 5); 6], 1100);
 
@@ -140,11 +161,11 @@ mod tests {
     #[test]
     fn begin_clears_previous_match() {
         let mut log = MatchLog::default();
-        log.begin(start());
+        log.begin(start(), 0);
         log.push_inputs(&[(5, 5); 3], 0);
         let mut next = start();
         next.match_id = 8;
-        log.begin(next);
+        log.begin(next, 0);
         assert_eq!(log.match_id, Some(8));
         assert_eq!(log.tick_count(), 0);
     }

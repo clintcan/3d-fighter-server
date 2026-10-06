@@ -28,6 +28,11 @@ pub struct ServerConfig {
     pub public_udp_host: String,
     pub log_format: String,
     pub log_ips: bool,
+    /// Reverse proxies whose `X-Forwarded-For` / `X-Real-IP` headers are trusted.
+    /// Entries are IP addresses or IPv4 CIDR blocks (for example `127.0.0.1`,
+    /// `10.0.0.0/8`). Empty means no proxy is trusted and forwarded headers are
+    /// ignored.
+    pub trusted_proxies: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -39,6 +44,7 @@ impl Default for ServerConfig {
             public_udp_host: "localhost".into(),
             log_format: "pretty".into(),
             log_ips: false,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -100,7 +106,19 @@ pub struct LimitsConfig {
     pub udp_unauth_per_second: u32,
     pub feed_frames_per_second: u32,
     pub spectator_max_queued_bytes: usize,
+    /// Maximum ticks a feed may run ahead of real time (60 ticks/s) plus this
+    /// backlog, so a reconnect can catch up but a flood is rejected.
+    pub feed_max_backlog_ticks: u32,
+    /// Server-wide budget for in-memory match logs (host + guest copies).
+    pub max_match_log_bytes: usize,
     pub resume_grace_ms: u64,
+    /// Cap on sessions kept for reconnection per client id.
+    pub max_lingering_sessions_per_client: usize,
+    pub max_replays: usize,
+    pub max_replay_bytes: u64,
+    pub http_timeout_ms: u64,
+    pub http_max_concurrency: usize,
+    pub max_rate_limit_sources: usize,
     pub ban_base_ms: u64,
     pub ban_max_ms: u64,
     pub shutdown_grace_ms: u64,
@@ -134,7 +152,15 @@ impl Default for LimitsConfig {
             udp_unauth_per_second: 20,
             feed_frames_per_second: 30,
             spectator_max_queued_bytes: 1024 * 1024,
+            feed_max_backlog_ticks: 120,
+            max_match_log_bytes: 256 * 1024 * 1024,
             resume_grace_ms: 30_000,
+            max_lingering_sessions_per_client: 3,
+            max_replays: 1_000,
+            max_replay_bytes: 512 * 1024 * 1024,
+            http_timeout_ms: 15_000,
+            http_max_concurrency: 256,
+            max_rate_limit_sources: 10_000,
             ban_base_ms: 10 * 60 * 1_000,
             ban_max_ms: 24 * 60 * 60 * 1_000,
             shutdown_grace_ms: 60_000,

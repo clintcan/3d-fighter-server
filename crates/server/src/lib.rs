@@ -8,6 +8,7 @@ pub mod http;
 pub mod lobby;
 pub mod metrics;
 pub mod moderation;
+pub mod proxy;
 pub mod relay;
 pub mod replays;
 pub mod serve;

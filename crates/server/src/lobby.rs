@@ -1,9 +1,8 @@
 //! In-memory lobby: sessions, rooms, and the message handlers (section 6).
 
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use fighter_protocol::clock::Clock;
 use fighter_protocol::feed::FeedFrame;
@@ -18,7 +17,7 @@ use fighter_protocol::json::{
     PROTOCOL_VERSION,
 };
 use fighter_protocol::ratelimit::TokenBucket;
-use fighter_protocol::udp::{BindRole, UdpDatagram};
+use fighter_protocol::udp::BindRole;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::mpsc::UnboundedSender;
@@ -26,8 +25,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::config::Config;
 use crate::metrics::Metrics;
 use crate::moderation::Bans;
-use crate::relay::{candidates_for, BindOutcome, Bindings, RelayOutcome};
-use crate::replays::{ReplayMeta, ReplayStore};
+use crate::relay::{candidates_for, Bindings};
+use crate::replays::{ReplayJob, ReplayMeta, ReplayStore};
 use crate::spectate::{MatchLog, SpectatorState, MAX_FEED_TICKS};
 
 /// Server -> client push.
@@ -90,6 +89,8 @@ pub struct Session {
     pub relay_only: bool,
     #[allow(dead_code)] // used for region discovery in M5
     pub region: Option<String>,
+    /// Resolved client address (peer, or forwarded behind a trusted proxy).
+    pub client_ip: std::net::IpAddr,
     pub out: Option<UnboundedSender<OutMsg>>,
     pub room: Option<String>,
     pub role: Option<Role>,
@@ -118,6 +119,7 @@ impl Session {
         content_hash: u32,
         relay_only: bool,
         region: Option<String>,
+        client_ip: std::net::IpAddr,
         out: UnboundedSender<OutMsg>,
         queued_bytes: Arc<AtomicUsize>,
         now: u64,
@@ -133,6 +135,7 @@ impl Session {
             content_hash,
             relay_only,
             region,
+            client_ip,
             out: Some(out),
             room: None,
             role: None,
@@ -207,6 +210,7 @@ pub struct Room {
     pub feed_verified: bool,
     pub matches_played: u32,
     pub spectator_peak: u32,
+    pub last_replay_ms: u64,
     dirty: bool,
     next_broadcast_ms: u64,
 }
@@ -231,11 +235,14 @@ pub struct Lobby {
     pub sessions: HashMap<String, Session>,
     pub rooms: HashMap<String, Room>,
     pub codes: HashMap<String, String>,
-    pub bindings: Bindings,
+    pub bindings: Arc<Mutex<Bindings>>,
     pub bans: Bans,
     pub resume_index: HashMap<String, String>,
     pub queue: VecDeque<QueueEntry>,
-    pub replays: ReplayStore,
+    pub replays: Arc<Mutex<ReplayStore>>,
+    replay_tx: UnboundedSender<ReplayJob>,
+    /// Running total of match-log bytes across all rooms, for the global budget.
+    pub log_bytes: usize,
     #[allow(dead_code)] // surfaced by admin/metrics in M5
     pub started_ms: u64,
     pub region: String,
@@ -250,16 +257,25 @@ pub struct QueueEntry {
 }
 
 impl Lobby {
-    pub fn new(started_ms: u64, region: String, bans: Bans, replays: ReplayStore) -> Self {
+    pub fn new(
+        started_ms: u64,
+        region: String,
+        bans: Bans,
+        replays: Arc<Mutex<ReplayStore>>,
+        replay_tx: UnboundedSender<ReplayJob>,
+        bindings: Arc<Mutex<Bindings>>,
+    ) -> Self {
         Self {
             sessions: HashMap::new(),
             rooms: HashMap::new(),
             codes: HashMap::new(),
-            bindings: Bindings::default(),
+            bindings,
             bans,
             resume_index: HashMap::new(),
             queue: VecDeque::new(),
             replays,
+            replay_tx,
+            log_bytes: 0,
             started_ms,
             region,
         }
@@ -313,6 +329,41 @@ impl Lobby {
     pub fn touch(&mut self, sid: &str, now: u64) {
         if let Some(sess) = self.sessions.get_mut(sid) {
             sess.last_seen_ms = now;
+        }
+    }
+
+    /// Disconnected sessions still kept for reconnection: (total, for this IP).
+    pub fn lingering_counts(&self, ip: std::net::IpAddr) -> (usize, usize) {
+        let mut total = 0;
+        let mut per_ip = 0;
+        for s in self.sessions.values() {
+            if s.disconnected_at.is_some() {
+                total += 1;
+                if s.client_ip == ip {
+                    per_ip += 1;
+                }
+            }
+        }
+        (total, per_ip)
+    }
+
+    /// Keep at most `max_lingering_sessions_per_client` disconnected sessions
+    /// per client, dropping the oldest (issue #12).
+    pub fn cap_lingering_for_client(&mut self, client_id: &str, ctx: &Ctx, now: u64) {
+        let max = ctx.config.limits.max_lingering_sessions_per_client;
+        loop {
+            let mut lingering: Vec<(u64, String)> = self
+                .sessions
+                .values()
+                .filter(|s| s.client_id == client_id && s.disconnected_at.is_some())
+                .map(|s| (s.disconnected_at.unwrap_or(0), s.id.clone()))
+                .collect();
+            if lingering.len() <= max {
+                break;
+            }
+            lingering.sort();
+            let oldest = lingering[0].1.clone();
+            self.remove_session(&oldest, LeaveReason::Disconnected, ctx, now);
         }
     }
 
@@ -864,6 +915,7 @@ impl Lobby {
             feed_verified: true,
             matches_played: 0,
             spectator_peak: 0,
+            last_replay_ms: 0,
             dirty: false,
             next_broadcast_ms: 0,
         };
@@ -1093,7 +1145,7 @@ impl Lobby {
                 g.role = Some(Role::Guest);
             }
             // Register UDP rendezvous slots for both players.
-            self.bindings.register(
+            self.bindings.lock().expect("bindings").register(
                 host.clone(),
                 room_id.clone(),
                 BindRole::Host,
@@ -1104,7 +1156,7 @@ impl Lobby {
                 now,
                 &ctx.config.limits,
             );
-            self.bindings.register(
+            self.bindings.lock().expect("bindings").register(
                 guest.clone(),
                 room_id.clone(),
                 BindRole::Guest,
@@ -1197,7 +1249,10 @@ impl Lobby {
         }
         // Invalidate both players' UDP bindings; a new guest gets fresh slots on
         // the next accept, and the kicked guest can no longer relay to the host.
-        self.bindings.unregister_room(&room_id);
+        self.bindings
+            .lock()
+            .expect("bindings")
+            .unregister_room(&room_id);
         if let Some(g) = self.sessions.get_mut(&guest) {
             g.room = None;
             g.role = None;
@@ -1552,7 +1607,7 @@ impl Lobby {
                 s.room = Some(room_id.clone());
                 s.role = Some(Role::Guest);
             }
-            self.bindings.register(
+            self.bindings.lock().expect("bindings").register(
                 host.clone(),
                 room_id.clone(),
                 BindRole::Host,
@@ -1563,7 +1618,7 @@ impl Lobby {
                 now,
                 &ctx.config.limits,
             );
-            self.bindings.register(
+            self.bindings.lock().expect("bindings").register(
                 guest.clone(),
                 room_id.clone(),
                 BindRole::Guest,
@@ -1639,7 +1694,14 @@ impl Lobby {
         room.guest = None;
         room.phase = Phase::Lobby;
         room.touch(now);
-        self.bindings.unregister_room(room_id);
+        // The match is over; free its logs.
+        self.log_bytes = self.log_bytes.saturating_sub(room_log_bytes(room));
+        room.log.clear();
+        room.guest_log.clear();
+        self.bindings
+            .lock()
+            .expect("bindings")
+            .unregister_room(room_id);
         if let Some(s) = self.sessions.get_mut(guest) {
             s.room = None;
             s.role = None;
@@ -1696,8 +1758,12 @@ impl Lobby {
         let Some(room) = self.rooms.remove(room_id) else {
             return;
         };
+        self.log_bytes = self.log_bytes.saturating_sub(room_log_bytes(&room));
         self.codes.remove(&room.code);
-        self.bindings.unregister_room(room_id);
+        self.bindings
+            .lock()
+            .expect("bindings")
+            .unregister_room(room_id);
         let mut targets = Vec::new();
         if let Some(g) = &room.guest {
             targets.push(g.clone());
@@ -1787,115 +1853,8 @@ impl Lobby {
 
     // -- UDP rendezvous and relay (section 7) -----------------------------
 
-    /// Handle one UDP datagram. Returns an address and bytes to send, if any.
-    /// The caller owns the socket and performs the send; this method never
-    /// awaits, so it is safe to call while holding the lobby lock.
-    pub fn handle_udp(
-        &mut self,
-        from: SocketAddr,
-        data: &[u8],
-        ctx: &Ctx,
-        now: u64,
-    ) -> Option<(SocketAddr, Vec<u8>)> {
-        let datagram = match UdpDatagram::decode(data) {
-            Ok(d) => d,
-            Err(_) => return None,
-        };
-        match datagram {
-            UdpDatagram::Bind {
-                session_token,
-                role,
-                candidates,
-            } => {
-                if !self.bindings.unauth_allowed(
-                    from.ip(),
-                    now,
-                    ctx.config.limits.udp_unauth_per_second,
-                ) {
-                    return None;
-                }
-                match self
-                    .bindings
-                    .bind(&session_token, role, from, candidates, now)
-                {
-                    BindOutcome::Bound { room_id, .. } => {
-                        let SocketAddr::V4(observed) = from else {
-                            return None; // v1 is IPv4 only
-                        };
-                        self.try_notify_peers(&room_id, now, ctx);
-                        let bound = UdpDatagram::Bound { observed }.encode();
-                        Some((from, bound))
-                    }
-                    BindOutcome::Invalid => None,
-                }
-            }
-            UdpDatagram::Relay { relay_key, payload } => {
-                let payload_len = payload.len();
-                match self.bindings.relay(&relay_key, from, payload_len, now) {
-                    RelayOutcome::Forward { to } => {
-                        ctx.metrics
-                            .relay_packets
-                            .with_label_values(&["forwarded"])
-                            .inc();
-                        ctx.metrics
-                            .relay_bytes
-                            .with_label_values(&["forwarded"])
-                            .inc_by(payload_len as u64);
-                        let relayed = UdpDatagram::Relayed { payload }.encode();
-                        Some((to, relayed))
-                    }
-                    RelayOutcome::RateLimited => {
-                        ctx.metrics
-                            .relay_packets
-                            .with_label_values(&["dropped"])
-                            .inc();
-                        None
-                    }
-                    RelayOutcome::NoPeer | RelayOutcome::Unknown | RelayOutcome::WrongSource => {
-                        // Unauthenticated or unbound: count against the source limit.
-                        self.bindings.unauth_allowed(
-                            from.ip(),
-                            now,
-                            ctx.config.limits.udp_unauth_per_second,
-                        );
-                        None
-                    }
-                }
-            }
-            UdpDatagram::Ping {
-                nonce,
-                client_time_ms,
-            } => {
-                if !self.bindings.unauth_allowed(
-                    from.ip(),
-                    now,
-                    ctx.config.limits.udp_unauth_per_second,
-                ) {
-                    return None;
-                }
-                if !self.bindings.ping_allowed(
-                    from.ip(),
-                    now,
-                    ctx.config.limits.udp_ping_per_second,
-                ) {
-                    return None;
-                }
-                let pong = UdpDatagram::Pong {
-                    nonce,
-                    client_time_ms,
-                }
-                .encode();
-                Some((from, pong))
-            }
-            // Clients never send these; drop silently.
-            UdpDatagram::Bound { .. } | UdpDatagram::Relayed { .. } | UdpDatagram::Pong { .. } => {
-                None
-            }
-        }
-    }
-
     /// Tell both players their peer's endpoints once both have bound.
-    fn try_notify_peers(&mut self, room_id: &str, now: u64, ctx: &Ctx) {
+    pub fn try_notify_peers(&mut self, room_id: &str, now: u64, ctx: &Ctx) {
         let Some(room) = self.rooms.get(room_id) else {
             return;
         };
@@ -1904,8 +1863,8 @@ impl Lobby {
             return;
         };
         let (host_candidates, guest_candidates) = {
-            let (Some(host_slot), Some(guest_slot)) =
-                (self.bindings.get(&host), self.bindings.get(&guest))
+            let bindings = self.bindings.lock().expect("bindings");
+            let (Some(host_slot), Some(guest_slot)) = (bindings.get(&host), bindings.get(&guest))
             else {
                 return;
             };
@@ -1937,8 +1896,9 @@ impl Lobby {
                 punch_at,
             },
         );
-        self.bindings.mark_notified(&host);
-        self.bindings.mark_notified(&guest);
+        let mut bindings = self.bindings.lock().expect("bindings");
+        bindings.mark_notified(&host);
+        bindings.mark_notified(&guest);
     }
 
     // -- spectator feed publishing (section 8) ----------------------------
@@ -1998,7 +1958,7 @@ impl Lobby {
             .inc();
 
         if !is_host {
-            self.verify_guest_frame(&room_id, frame, ctx);
+            self.verify_guest_frame(&room_id, frame, ctx, now);
             return ConnAction::None;
         }
 
@@ -2010,11 +1970,12 @@ impl Lobby {
                     self.send_error(sid, ErrorCode::BadMessage, "match_id must change", None);
                     return ConnAction::None;
                 }
+                let before = room_log_bytes(&self.rooms[&room_id]);
                 self.rooms
                     .get_mut(&room_id)
                     .expect("room exists")
                     .log
-                    .begin(start);
+                    .begin(start, now);
                 {
                     let room = self.rooms.get_mut(&room_id).expect("room exists");
                     // Only reset the guest's copy when it is a different match;
@@ -2024,6 +1985,8 @@ impl Lobby {
                     }
                     room.feed_verified = true;
                 }
+                let after = room_log_bytes(&self.rooms[&room_id]);
+                self.log_bytes = adjust_log_bytes(self.log_bytes, before, after);
                 let specs = self.rooms[&room_id].spectators.clone();
                 for spec in specs {
                     if let Some(s) = self.sessions.get_mut(&spec) {
@@ -2051,12 +2014,34 @@ impl Lobby {
                     self.send_error(sid, ErrorCode::BadMessage, "feed too long", None);
                     return ConnAction::None;
                 }
+                // A feed may not run more than the configured backlog ahead of
+                // real time (60 ticks per second since MATCH_START).
+                let elapsed_ms = now.saturating_sub(log.started_ms);
+                let allowed = (elapsed_ms.saturating_mul(60) / 1000) as u32
+                    + ctx.config.limits.feed_max_backlog_ticks;
+                if first_tick.saturating_add(inputs.len() as u32) > allowed {
+                    self.send_error(
+                        sid,
+                        ErrorCode::BadMessage,
+                        "feed faster than real time",
+                        None,
+                    );
+                    return ConnAction::None;
+                }
+                // Global match-log budget across all rooms.
+                if self.log_bytes.saturating_add(inputs.len() * 4)
+                    > ctx.config.limits.max_match_log_bytes
+                {
+                    self.send_error(sid, ErrorCode::ServerFull, "match log budget reached", None);
+                    return ConnAction::None;
+                }
                 let start = log.tick_count();
                 self.rooms
                     .get_mut(&room_id)
                     .expect("room exists")
                     .log
                     .push_inputs(&inputs, now);
+                self.log_bytes = self.log_bytes.saturating_add(inputs.len() * 4);
                 let mismatch = {
                     let room = &self.rooms[&room_id];
                     room.feed_verified && inputs_mismatch(room, start, &inputs)
@@ -2078,11 +2063,16 @@ impl Lobby {
                     self.send_error(sid, ErrorCode::BadMessage, "bad checksum", None);
                     return ConnAction::None;
                 }
+                if self.log_bytes.saturating_add(12) > ctx.config.limits.max_match_log_bytes {
+                    self.send_error(sid, ErrorCode::ServerFull, "match log budget reached", None);
+                    return ConnAction::None;
+                }
                 self.rooms
                     .get_mut(&room_id)
                     .expect("room exists")
                     .log
                     .push_checksum(tick, checksum, now);
+                self.log_bytes = self.log_bytes.saturating_add(12);
             }
             FeedFrame::MatchEnd {
                 match_id,
@@ -2118,14 +2108,20 @@ impl Lobby {
     }
 
     /// Store the guest's copy of the feed and compare it with the host's.
-    fn verify_guest_frame(&mut self, room_id: &str, frame: FeedFrame, ctx: &Ctx) {
+    fn verify_guest_frame(&mut self, room_id: &str, frame: FeedFrame, ctx: &Ctx, now: u64) {
         let mut mismatch = false;
+        let budget = ctx.config.limits.max_match_log_bytes;
+        let current = self.log_bytes;
+        let before = match self.rooms.get(room_id) {
+            Some(room) => room_log_bytes(room),
+            None => return,
+        };
         {
             let Some(room) = self.rooms.get_mut(room_id) else {
                 return;
             };
             match frame {
-                FeedFrame::MatchStart(start) => room.guest_log.begin(start),
+                FeedFrame::MatchStart(start) => room.guest_log.begin(start, now),
                 FeedFrame::Inputs {
                     match_id,
                     first_tick,
@@ -2134,6 +2130,9 @@ impl Lobby {
                     if room.guest_log.match_id != Some(match_id)
                         || first_tick as usize != room.guest_log.tick_count()
                     {
+                        return;
+                    }
+                    if current.saturating_add(inputs.len() * 4) > budget {
                         return;
                     }
                     let start = room.guest_log.tick_count();
@@ -2150,6 +2149,9 @@ impl Lobby {
                     if room.guest_log.match_id != Some(match_id) {
                         return;
                     }
+                    if current.saturating_add(12) > budget {
+                        return;
+                    }
                     room.guest_log.push_checksum(tick, checksum, 0);
                     if room.feed_verified {
                         if let Some((_, host_checksum, _)) =
@@ -2164,6 +2166,11 @@ impl Lobby {
                 FeedFrame::MatchEnd { .. } | FeedFrame::FeedReset { .. } => {}
             }
         }
+        let after = match self.rooms.get(room_id) {
+            Some(room) => room_log_bytes(room),
+            None => return,
+        };
+        self.log_bytes = adjust_log_bytes(self.log_bytes, before, after);
         if mismatch {
             self.mark_feed_mismatch(room_id, ctx);
         }
@@ -2187,20 +2194,24 @@ impl Lobby {
 
     /// Write a finished match to the replay store.
     fn store_replay(&mut self, room_id: &str, ctx: &Ctx, now: u64) {
-        if !self.replays.enabled() {
+        if !self.replays.lock().expect("replays").enabled() {
             return;
         }
-        let Some(room) = self.rooms.get(room_id) else {
-            return;
+        let (start, end) = match self.rooms.get(room_id) {
+            Some(room) => match (room.log.start.clone(), room.log.end.clone()) {
+                (Some(s), Some((e, _))) => (s, e),
+                _ => return,
+            },
+            None => return,
         };
-        let Some(start) = room.log.start.clone() else {
+        // Only plausible, non-trivial matches, and at most one replay a second
+        // per room (issue #9).
+        if end.final_tick < 60 || now.saturating_sub(self.rooms[room_id].last_replay_ms) < 1_000 {
             return;
-        };
-        let Some((end, _)) = room.log.end.clone() else {
-            return;
-        };
+        }
         let mut body = Vec::new();
         {
+            let room = &self.rooms[room_id];
             let mut push = |frame: FeedFrame| {
                 if let Ok(bytes) = frame.encode() {
                     body.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -2247,15 +2258,20 @@ impl Lobby {
             duration_ticks: end.final_tick,
             finished_at: now,
             game_version: start.game_version.clone(),
-            content_hash: room.host_content_hash,
+            content_hash: self.rooms[room_id].host_content_hash,
         };
-        let _ = self.replays.save(meta, &body);
+        if let Some(room) = self.rooms.get_mut(room_id) {
+            room.last_replay_ms = now;
+        }
+        // Hand the write to the background task: no file I/O under the lock.
+        let _ = self.replay_tx.send((meta, body));
         ctx.metrics.matches.with_label_values(&["stored"]).inc();
     }
 
     /// End the current feed, tell spectators, and start fresh.
     fn feed_reset(&mut self, room_id: &str, match_id: u32, ctx: &Ctx) {
         if let Some(room) = self.rooms.get_mut(room_id) {
+            self.log_bytes = self.log_bytes.saturating_sub(room_log_bytes(room));
             room.log.clear();
             room.guest_log.clear();
         }
@@ -2402,7 +2418,7 @@ impl Lobby {
         let now = ctx.clock.now_ms();
 
         // Expire UDP bindings and prune their rate-limit buckets.
-        self.bindings.sweep(
+        self.bindings.lock().expect("bindings").sweep(
             now,
             ctx.config.limits.binding_expiry_ms,
             ctx.config.limits.binding_max_age_ms,
@@ -2424,6 +2440,8 @@ impl Lobby {
 
         // Reap old replays.
         self.replays
+            .lock()
+            .expect("replays")
             .cleanup(now, ctx.config.storage.replay_retention_days);
 
         // Expire pending joins.
@@ -2575,6 +2593,16 @@ fn inputs_mismatch(room: &Room, start: usize, inputs: &[(u16, u16)]) -> bool {
     false
 }
 
+/// Total match-log bytes for a room (host plus guest copies).
+fn room_log_bytes(room: &Room) -> usize {
+    room.log.byte_size() + room.guest_log.byte_size()
+}
+
+/// Apply a before/after delta to a running byte total, saturating at zero.
+fn adjust_log_bytes(total: usize, before: usize, after: usize) -> usize {
+    (total as i64 - before as i64 + after as i64).max(0) as usize
+}
+
 /// Compare dotted versions like `"0.4.1"`. Missing parts count as zero.
 pub fn version_lt(a: &str, b: &str) -> bool {
     fn parse(v: &str) -> Vec<u64> {
@@ -2620,11 +2648,19 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_lobby() -> Lobby {
+        let (replay_tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         Lobby::new(
             0,
             "test".into(),
             Bans::new(600_000, 86_400_000),
-            ReplayStore::new(PathBuf::from("target/test-replays"), false),
+            Arc::new(Mutex::new(ReplayStore::new(
+                PathBuf::from("target/test-replays"),
+                false,
+                1_000,
+                512 * 1024 * 1024,
+            ))),
+            replay_tx,
+            Arc::new(Mutex::new(Bindings::default())),
         )
     }
 
@@ -2638,6 +2674,7 @@ mod tests {
             111,
             false,
             None,
+            "127.0.0.1".parse().unwrap(),
             tx,
             Arc::new(AtomicUsize::new(0)),
             now,

@@ -7,12 +7,15 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use fighter_protocol::clock::Clock;
+use tokio::sync::mpsc;
 
 use crate::config::Config;
 use crate::lobby::{Ctx, Lobby};
 use crate::metrics::Metrics;
 use crate::moderation::Bans;
-use crate::replays::ReplayStore;
+use crate::proxy::{parse_trusted, IpAllow};
+use crate::relay::Bindings;
+use crate::replays::{ReplayJob, ReplayStore};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -22,10 +25,16 @@ pub struct AppState {
     pub clock: Arc<dyn Clock>,
     pub blocklist: Arc<Vec<String>>,
     pub admin_token: Option<String>,
+    pub trusted_proxies: Arc<Vec<IpAllow>>,
+    pub replays: Arc<Mutex<ReplayStore>>,
+    /// UDP rendezvous/relay state, behind its own lock so the relay path never
+    /// contends with the lobby (issue #11).
+    pub bindings: Arc<Mutex<Bindings>>,
     pub shutting_down: Arc<AtomicBool>,
     pub rooms_cache: Arc<Mutex<Option<(u64, String)>>>,
     conn_total: Arc<AtomicUsize>,
     conn_per_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    replay_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<ReplayJob>>>>,
 }
 
 impl AppState {
@@ -33,10 +42,15 @@ impl AppState {
         let region = config.server.region.clone();
         let blocklist = Arc::new(config.moderation.blocklist.clone());
         let bans = Bans::new(config.limits.ban_base_ms, config.limits.ban_max_ms);
-        let replays = ReplayStore::new(
+        let replays = Arc::new(Mutex::new(ReplayStore::new(
             PathBuf::from(&config.storage.replay_dir),
             config.storage.replays,
-        );
+            config.limits.max_replays,
+            config.limits.max_replay_bytes,
+        )));
+        let (replay_tx, replay_rx) = mpsc::unbounded_channel::<ReplayJob>();
+        let trusted_proxies = Arc::new(parse_trusted(&config.server.trusted_proxies));
+        let bindings = Arc::new(Mutex::new(Bindings::default()));
         let admin_token = config
             .admin
             .token
@@ -44,17 +58,33 @@ impl AppState {
             .or_else(|| std::env::var(&config.admin.token_env).ok())
             .filter(|t| !t.is_empty());
         Self {
-            lobby: Arc::new(Mutex::new(Lobby::new(started_ms, region, bans, replays))),
+            lobby: Arc::new(Mutex::new(Lobby::new(
+                started_ms,
+                region,
+                bans,
+                replays.clone(),
+                replay_tx,
+                bindings.clone(),
+            ))),
             config: Arc::new(config),
             metrics: Arc::new(Metrics::new()),
             clock,
             blocklist,
             admin_token,
+            trusted_proxies,
+            replays,
+            bindings,
             shutting_down: Arc::new(AtomicBool::new(false)),
             rooms_cache: Arc::new(Mutex::new(None)),
             conn_total: Arc::new(AtomicUsize::new(0)),
             conn_per_ip: Arc::new(Mutex::new(HashMap::new())),
+            replay_rx: Arc::new(Mutex::new(Some(replay_rx))),
         }
+    }
+
+    /// Take the replay writer receiver once, so `serve` can spawn the writer.
+    pub fn take_replay_receiver(&self) -> Option<mpsc::UnboundedReceiver<ReplayJob>> {
+        self.replay_rx.lock().expect("replay rx").take()
     }
 
     /// Borrowed handler context.
@@ -68,16 +98,25 @@ impl AppState {
     }
 
     /// Reserve a connection slot, or return false if a limit is reached.
-    pub fn try_acquire_conn(&self, ip: IpAddr) -> bool {
+    /// `lingering_total` / `lingering_ip` are disconnected sessions kept for
+    /// reconnection, which still count against the limits (issue #12).
+    pub fn try_acquire_conn(
+        &self,
+        ip: IpAddr,
+        lingering_total: usize,
+        lingering_ip: usize,
+    ) -> bool {
         if self.shutting_down.load(Ordering::SeqCst) {
             return false;
         }
-        if self.conn_total.load(Ordering::SeqCst) >= self.config.limits.max_connections {
+        if self.conn_total.load(Ordering::SeqCst) + lingering_total
+            >= self.config.limits.max_connections
+        {
             return false;
         }
         let mut per_ip = self.conn_per_ip.lock().expect("conn map");
         let entry = per_ip.entry(ip).or_insert(0);
-        if *entry >= self.config.limits.max_connections_per_ip {
+        if *entry + lingering_ip >= self.config.limits.max_connections_per_ip {
             return false;
         }
         *entry += 1;

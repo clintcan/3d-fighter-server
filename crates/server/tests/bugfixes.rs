@@ -5,7 +5,8 @@ mod common;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use common::{pair_up, start_test, Client, Ws};
+use common::{pair_up, start_test, start_with, test_config, Client, Ws};
+use fighter_protocol::feed::{FeedFrame, MatchStart};
 use fighter_protocol::udp::{BindRole, UdpDatagram};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
@@ -43,6 +44,34 @@ fn relay_datagram(key: [u8; 8], payload: Vec<u8>) -> Vec<u8> {
         payload,
     }
     .encode()
+}
+
+fn start_frame(match_id: u32) -> Vec<u8> {
+    FeedFrame::MatchStart(MatchStart {
+        feed_version: 1,
+        match_id,
+        stage_index: 0,
+        p1_fighter_index: 0,
+        p2_fighter_index: 1,
+        game_version: "0.4.1".into(),
+        stage_id: "ring".into(),
+        p1_fighter_id: "kenji".into(),
+        p2_fighter_id: "rhea".into(),
+        p1_name: "A".into(),
+        p2_name: "B".into(),
+    })
+    .encode()
+    .unwrap()
+}
+
+fn inputs_frame(match_id: u32, first_tick: u32, count: usize) -> Vec<u8> {
+    FeedFrame::Inputs {
+        match_id,
+        first_tick,
+        inputs: vec![(0x0015, 0x0015); count],
+    }
+    .encode()
+    .unwrap()
 }
 
 /// Read until a JSON `pong`, returning false on close/timeout.
@@ -249,4 +278,85 @@ async fn rid_is_echoed() {
         .await;
     let started = spec.recv_type("spectate_started").await;
     assert_eq!(started["rid"], "s1");
+}
+
+// A1: a feed far faster than real time is rejected.
+#[tokio::test]
+async fn feed_faster_than_real_time_is_rejected() {
+    let mut config = test_config();
+    config.limits.feed_max_backlog_ticks = 120; // production default
+    let (running, _clock) = start_with(config).await;
+    let url = running.ws_url();
+    let mut pair = pair_up(&url, false, false).await;
+
+    pair.host.send_binary(start_frame(1)).await;
+    // 600 ticks in one frame at t=0 exceeds 60/s + 120 backlog.
+    pair.host.send_binary(inputs_frame(1, 0, 600)).await;
+    let err = pair.host.recv_type("error").await;
+    assert_eq!(err["code"], "bad_message");
+}
+
+// A2: oversized text is rejected before parsing.
+#[tokio::test]
+async fn oversized_text_is_rejected() {
+    let (running, _clock) = start_test().await;
+    let url = running.ws_url();
+    let mut client = Client::connect(&url, "A", "0.4.1", 111).await;
+    let big = "x".repeat(9 * 1024);
+    client.ws.send(Message::Text(big.into())).await.unwrap();
+    let err = client.recv_type("error").await;
+    assert_eq!(err["code"], "bad_message");
+}
+
+// A2: an oversized binary frame closes the connection.
+#[tokio::test]
+async fn oversized_binary_closes_connection() {
+    let (running, _clock) = start_test().await;
+    let url = running.ws_url();
+    let mut client = Client::connect(&url, "A", "0.4.1", 111).await;
+    let big = vec![0u8; 65 * 1024];
+    let _ = client.ws.send(Message::Binary(big.into())).await;
+    let closed = timeout(Duration::from_secs(2), async {
+        loop {
+            match client.ws.next().await {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return true,
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(closed, "server should close on an oversized binary frame");
+}
+
+// A3: behind a trusted proxy, bans apply per forwarded address.
+#[tokio::test]
+async fn trusted_proxy_bans_per_forwarded_address() {
+    let mut config = test_config();
+    config.server.trusted_proxies = vec!["127.0.0.1".into()];
+    let (running, _clock) = start_with(config).await;
+    let url = running.ws_url();
+    let hello = |cid: &str| {
+        json!({
+            "type":"hello","protocol":1,"game_version":"0.4.1","content_hash":111,
+            "client_id":cid,"name":"Bad"
+        })
+    };
+
+    let mut a = Client::hello_raw_with(&url, hello("a"), &[("x-forwarded-for", "1.2.3.4")]).await;
+    a.recv_type("welcome").await;
+    for _ in 0..10 {
+        a.ws.send(Message::Text("not json".into())).await.unwrap();
+        let _ = a.recv_type("error").await;
+    }
+
+    // Same forwarded address is banned...
+    let mut c = Client::hello_raw_with(&url, hello("c"), &[("x-forwarded-for", "1.2.3.4")]).await;
+    let first = c.recv().await;
+    assert_eq!(first["type"], "error");
+    assert_eq!(first["code"], "not_allowed");
+
+    // ...but a different forwarded address is not.
+    let mut b = Client::hello_raw_with(&url, hello("b"), &[("x-forwarded-for", "5.6.7.8")]).await;
+    assert_eq!(b.recv().await["type"], "welcome");
 }

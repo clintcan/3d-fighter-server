@@ -5,6 +5,10 @@ udp_bind = "0.0.0.0:7780"
 public_udp_host = "fighter-asia.example.com"   # what clients are told in welcome.udp
 log_format = "json"            # or "pretty"
 log_ips = false
+# Reverse proxies whose X-Forwarded-For / X-Real-IP headers are trusted (IPs or
+# IPv4 CIDR). Required when TLS terminates at Caddy/nginx, so bans and per-IP
+# limits apply to the real client instead of the proxy. Empty = trust nobody.
+trusted_proxies = []
 
 [tls]                          # optional: terminate TLS in-process
 # cert = "/etc/fighter/cert.pem"
@@ -23,6 +27,13 @@ max_connections = 10000
 max_connections_per_ip = 32
 max_rooms = 5000
 default_spectator_delay_ms = 3000
+# A feed may not run more than this many ticks ahead of real time (60/s).
+feed_max_backlog_ticks = 120
+# Server-wide cap on in-memory match logs.
+max_match_log_bytes = 268435456
+# Replay store quotas (oldest evicted first).
+max_replays = 1000
+max_replay_bytes = 536870912
 
 [admin]
 token_env = "FIGHTER_ADMIN_TOKEN"   # admin API enabled only if this variable is set

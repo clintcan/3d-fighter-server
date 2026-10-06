@@ -33,6 +33,9 @@ pub fn test_config() -> Config {
     c.limits.spectator_max_queued_bytes = 65536;
     // Feed rate limiting is exercised separately; tests publish in bursts.
     c.limits.feed_frames_per_second = 1_000_000;
+    // Tests publish whole matches at a frozen clock; the real-time feed limit is
+    // exercised by its own test with the production default.
+    c.limits.feed_max_backlog_ticks = 10_000_000;
     c
 }
 
@@ -132,11 +135,23 @@ impl Client {
     /// Open a connection and send `hello` without waiting for a welcome, so the
     /// caller can inspect the first server message.
     pub async fn hello_raw(url: &str, hello: Value) -> Self {
+        Self::hello_raw_with(url, hello, &[]).await
+    }
+
+    /// Like [`Self::hello_raw`] but adds extra request headers (for proxy tests).
+    pub async fn hello_raw_with(url: &str, hello: Value, headers: &[(&str, &str)]) -> Self {
+        use tokio_tungstenite::tungstenite::http::HeaderName;
         let mut req = url.into_client_request().expect("request");
         req.headers_mut().insert(
             "Sec-WebSocket-Protocol",
             HeaderValue::from_static("3dfighter.lobby.v1"),
         );
+        for (k, v) in headers {
+            req.headers_mut().insert(
+                HeaderName::from_bytes(k.as_bytes()).expect("header name"),
+                HeaderValue::from_str(v).expect("header value"),
+            );
+        }
         let (ws, _resp) = connect_async(req).await.expect("ws connect");
         let mut client = Client {
             ws,

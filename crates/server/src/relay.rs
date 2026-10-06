@@ -264,6 +264,9 @@ impl Bindings {
     }
 }
 
+/// Hard cap on the number of per-source rate-limit entries (issue #11).
+const MAX_RATE_SOURCES: usize = 65_536;
+
 fn allow(
     buckets: &mut HashMap<IpAddr, (TokenBucket, u64)>,
     ip: IpAddr,
@@ -271,6 +274,17 @@ fn allow(
     per_sec: u32,
 ) -> bool {
     let per_sec = per_sec.max(1);
+    if buckets.len() >= MAX_RATE_SOURCES && !buckets.contains_key(&ip) {
+        // Evict the least-recently-used source so the map cannot grow without
+        // bound under a spoofed-source flood.
+        if let Some(oldest) = buckets
+            .iter()
+            .min_by_key(|(_, (_, last))| *last)
+            .map(|(k, _)| *k)
+        {
+            buckets.remove(&oldest);
+        }
+    }
     let entry = buckets.entry(ip).or_insert_with(|| {
         (
             TokenBucket::new(per_sec.saturating_mul(2), per_sec as f64),

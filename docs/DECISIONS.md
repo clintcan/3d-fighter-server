@@ -204,3 +204,42 @@ bottom.
 - **`max_connections_per_ip` defaults to 32** (was 8) because players behind
   carrier-grade NAT or on one LAN share a public IP; documented in the example
   config.
+
+## Hardening (adversarial review)
+
+- **Feeds are limited to real time, and match logs have a global budget.** A feed
+  may run at most `feed_max_backlog_ticks` (default 120, i.e. 2 s) ahead of 60
+  ticks per second since `MATCH_START`; beyond that the frame is rejected. A
+  server-wide `max_match_log_bytes` budget rejects further inputs with
+  `server_full`. The guest verification copy still exists; trimming agreed
+  prefixes is left as a future optimisation because the budget already bounds
+  total memory.
+- **WebSocket message sizes are enforced.** The upgrade sets `max_message_size`
+  and `max_frame_size` to 64 KiB (the binary cap); text frames over the 8 KiB spec
+  limit are rejected before parsing and count as a strike.
+- **Client IPs come from `X-Forwarded-For` only behind a trusted proxy.**
+  `server.trusted_proxies` lists proxy addresses or IPv4 CIDRs. The right-most
+  untrusted `X-Forwarded-For` entry, or `X-Real-IP`, is used for per-IP limits,
+  strikes and bans; otherwise the TCP peer is used. Without a configured proxy,
+  loopback/private peers are never the target of IP strikes, so a shared address
+  (a LAN, or Caddy on localhost) is not banned wholesale. This is the fix for the
+  DigitalOcean/Caddy lockout.
+- **Replay writes run off the lobby lock.** `store_replay` builds the body under
+  the lock and sends it to a background writer (`serve::replay_writer`), which
+  writes on a blocking thread and appends to a sorted in-memory index. The store
+  enforces `max_replays` and `max_replay_bytes`, evicting the oldest first, and
+  only stores matches of at least 60 ticks at most once per second per room.
+- **HTTP has timeouts and a concurrency cap.** `TimeoutLayer` bounds request
+  handling and `ConcurrencyLimitLayer` bounds in-flight requests. Replay files are
+  streamed, the replay list is kept sorted, and `/metrics` requires the admin
+  token when one is configured. Header-read (slowloris) timeouts are left to the
+  fronting proxy; `axum::serve` does not expose hyper's header timeout.
+- **Bindings live behind their own lock.** The UDP task decodes before taking any
+  lock; RELAY and PING touch only `Bindings`, and only BIND takes the lobby lock,
+  briefly, to notify peers. The lock order is always lobby -> bindings. Per-source
+  rate-limit maps are capped (LRU eviction) so a spoofed-source flood cannot grow
+  them without bound.
+- **Lingering sessions count toward connection limits.** Disconnected sessions kept
+  for reconnection are included in the total and per-IP connection counts, and a
+  client may keep at most `max_lingering_sessions_per_client` (default 3); older
+  ones are dropped when it connects again without a resume token.

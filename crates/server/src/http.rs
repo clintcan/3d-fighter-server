@@ -3,6 +3,7 @@
 
 use std::net::IpAddr;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -12,11 +13,15 @@ use axum::{Json, Router};
 use fighter_protocol::json::{Severity, Visibility};
 use serde_json::{json, Value};
 use subtle::ConstantTimeEq;
+use tower::limit::ConcurrencyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 
 use crate::app::AppState;
 use crate::ws::ws_handler;
 
 pub fn router(state: AppState) -> Router {
+    let timeout = Duration::from_millis(state.config.limits.http_timeout_ms);
+    let concurrency = state.config.limits.http_max_concurrency;
     Router::new()
         .route("/v1/ws", get(ws_handler))
         .route("/healthz", get(healthz))
@@ -29,6 +34,12 @@ pub fn router(state: AppState) -> Router {
         .route("/admin/rooms", get(admin_rooms))
         .route("/admin/rooms/{id}/close", post(admin_close))
         .route("/admin/ban", post(admin_ban))
+        // Bound how long a request may take and how many run at once (#10).
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            timeout,
+        ))
+        .layer(ConcurrencyLimitLayer::new(concurrency))
         .with_state(state)
 }
 
@@ -40,7 +51,11 @@ async fn healthz(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn metrics(State(state): State<AppState>) -> Response {
+async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    // When an admin token is configured, /metrics requires it too (issue #10).
+    if state.admin_token.is_some() && admin_ok(&state, &headers).is_some() {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
     (
         StatusCode::OK,
         [(
@@ -131,24 +146,35 @@ async fn regions(State(state): State<AppState>) -> Response {
 }
 
 async fn replays_list(State(state): State<AppState>) -> Response {
-    let lobby = state.lobby.lock().expect("lobby lock");
-    if !lobby.replays.enabled() {
+    let store = state.replays.lock().expect("replays");
+    if !store.enabled() {
         return (StatusCode::NOT_FOUND, "replays disabled").into_response();
     }
-    let (replays, next_cursor) = lobby.replays.list(50, None);
+    let (replays, next_cursor) = store.list(50, None);
     Json(json!({ "replays": replays, "next_cursor": next_cursor })).into_response()
 }
 
 async fn replay_get(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let lobby = state.lobby.lock().expect("lobby lock");
-    match lobby.replays.load(&id) {
-        Some(bytes) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/vnd.3dfighter.replay")],
-            bytes,
-        )
-            .into_response(),
-        None => (StatusCode::NOT_FOUND, "no such replay").into_response(),
+    // Stream the file rather than reading it all into memory (issue #10).
+    let path = {
+        let store = state.replays.lock().expect("replays");
+        store.path(&id)
+    };
+    let Some(path) = path else {
+        return (StatusCode::NOT_FOUND, "no such replay").into_response();
+    };
+    match tokio::fs::File::open(&path).await {
+        Ok(file) => {
+            let stream = tokio_util::io::ReaderStream::new(file);
+            let body = axum::body::Body::from_stream(stream);
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/vnd.3dfighter.replay")],
+                body,
+            )
+                .into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "no such replay").into_response(),
     }
 }
 

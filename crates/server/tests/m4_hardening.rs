@@ -62,8 +62,15 @@ async fn guest_reported_disconnected_after_grace() {
 async fn repeated_malformed_messages_ban_the_source() {
     let (running, _clock) = start_test().await;
     let url = running.ws_url();
-    let mut client = Client::connect(&url, "Bad", "0.4.1", 111).await;
+    let hello = |cid: &str| {
+        json!({
+            "type":"hello","protocol":1,"game_version":"0.4.1","content_hash":111,
+            "client_id":cid,"name":"Bad"
+        })
+    };
 
+    let mut client = Client::hello_raw(&url, hello("repeat-id")).await;
+    client.recv_type("welcome").await;
     for _ in 0..10 {
         client
             .ws
@@ -73,15 +80,9 @@ async fn repeated_malformed_messages_ban_the_source() {
         let _ = client.recv_type("error").await;
     }
 
-    // A fresh connection from the same IP is refused.
-    let mut fresh = Client::hello_raw(
-        &url,
-        json!({
-            "type":"hello","protocol":1,"game_version":"0.4.1","content_hash":111,
-            "client_id":"someone-else","name":"Nope"
-        }),
-    )
-    .await;
+    // The same client id is refused. (IP strikes are skipped for loopback peers,
+    // so the ban is by client id here; see the proxy test for IP bans.)
+    let mut fresh = Client::hello_raw(&url, hello("repeat-id")).await;
     let first = fresh.recv().await;
     assert_eq!(first["type"], "error");
     assert_eq!(first["code"], "not_allowed");

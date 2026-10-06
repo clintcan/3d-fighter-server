@@ -150,13 +150,13 @@ async fn finished_match_is_stored_and_downloadable() {
 
     pair.host.send_binary(start_frame(1)).await;
     pair.host
-        .send_binary(inputs_frame(1, 0, 0x0015, 0x0015, 6))
+        .send_binary(inputs_frame(1, 0, 0x0015, 0x0015, 60))
         .await;
     pair.host
         .send_binary(
             FeedFrame::MatchEnd {
                 match_id: 1,
-                final_tick: 6,
+                final_tick: 60,
                 result: MatchResult::P1Won,
                 p1_wins: 2,
                 p2_wins: 0,
@@ -165,7 +165,7 @@ async fn finished_match_is_stored_and_downloadable() {
             .unwrap(),
         )
         .await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
 
     let (status, body) = http_request(running.addr, "GET", "/v1/replays", &[], "").await;
     assert_eq!(status, 200);

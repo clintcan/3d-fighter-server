@@ -11,13 +11,17 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use fighter_protocol::json as proto;
-use fighter_protocol::json::{parse_client_message, ClientParseError, ErrorCode, LeaveReason};
+use fighter_protocol::json::{
+    parse_client_message, ClientParseError, ErrorCode, LeaveReason, MAX_BINARY_FRAME,
+    MAX_TEXT_FRAME,
+};
 use futures_util::stream::SplitStream;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 
 use crate::app::AppState;
 use crate::lobby::{version_lt, welcome_message, ConnAction, OutMsg, Session};
+use crate::proxy::{resolve_client_ip, strike_ip};
 
 const SUBPROTOCOL: &str = "3dfighter.lobby.v1";
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -44,8 +48,14 @@ pub async fn ws_handler(
         )
             .into_response();
     }
-    let ip = peer.ip();
-    if !state.try_acquire_conn(ip) {
+    let peer_ip = peer.ip();
+    let client_ip = resolve_client_ip(peer_ip, &headers, &state.trusted_proxies);
+    let strike = strike_ip(peer_ip, client_ip, &state.trusted_proxies);
+    let (lingering_total, lingering_ip) = {
+        let lobby = state.lobby.lock().expect("lobby lock");
+        lobby.lingering_counts(client_ip)
+    };
+    if !state.try_acquire_conn(client_ip, lingering_total, lingering_ip) {
         state
             .metrics
             .connections_rejected
@@ -54,10 +64,12 @@ pub async fn ws_handler(
         return (StatusCode::SERVICE_UNAVAILABLE, "server full").into_response();
     }
     state.metrics.connections_total.inc();
-    ws.protocols([SUBPROTOCOL])
+    ws.max_message_size(MAX_BINARY_FRAME)
+        .max_frame_size(MAX_BINARY_FRAME)
+        .protocols([SUBPROTOCOL])
         .on_upgrade(move |socket| async move {
-            handle_socket(socket, state.clone(), ip).await;
-            state.release_conn(ip);
+            handle_socket(socket, state.clone(), client_ip, strike).await;
+            state.release_conn(client_ip);
         })
 }
 
@@ -83,7 +95,47 @@ async fn read_hello(stream: &mut SplitStream<WebSocket>) -> Option<proto::Hello>
     }
 }
 
-async fn handle_socket(socket: WebSocket, state: AppState, ip: IpAddr) {
+/// Record a malformed/oversized message as a strike. Returns true if the
+/// connection must be closed (too many strikes, or now banned).
+fn handle_strike(state: &AppState, sid: &str, strike: Option<IpAddr>, message: &str) -> bool {
+    state.metrics.malformed.inc();
+    let ctx = state.ctx();
+    let now = state.clock.now_ms();
+    let mut lobby = state.lobby.lock().expect("lobby lock");
+    lobby.send_error(sid, ErrorCode::BadMessage, message, None);
+    let hash = lobby.sessions.get(sid).map(|s| s.client_id_hash.clone());
+    let banned = lobby.bans.record(hash.as_deref(), strike, now);
+    if lobby.note_malformed(sid, now) {
+        lobby.remove_session_closing(
+            sid,
+            LeaveReason::Disconnected,
+            &ctx,
+            now,
+            4000,
+            "too many malformed messages",
+        );
+        return true;
+    }
+    if banned {
+        lobby.remove_session_closing(
+            sid,
+            LeaveReason::Disconnected,
+            &ctx,
+            now,
+            4000,
+            "temporarily banned",
+        );
+        return true;
+    }
+    false
+}
+
+async fn handle_socket(
+    socket: WebSocket,
+    state: AppState,
+    client_ip: IpAddr,
+    strike: Option<IpAddr>,
+) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<OutMsg>();
     let queued_bytes = Arc::new(AtomicUsize::new(0));
@@ -181,7 +233,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, ip: IpAddr) {
     let client_hash = crate::lobby::client_id_hash(&hello.client_id);
     let banned = {
         let lobby = state.lobby.lock().expect("lobby lock");
-        lobby.bans.is_banned_client(&client_hash, now) || lobby.bans.is_banned_ip(ip, now)
+        lobby.bans.is_banned_client(&client_hash, now) || lobby.bans.is_banned_ip(client_ip, now)
     };
     if banned {
         let _ = tx.send(OutMsg::Text(
@@ -221,12 +273,16 @@ async fn handle_socket(socket: WebSocket, state: AppState, ip: IpAddr) {
                     hello.content_hash,
                     hello.relay_only.unwrap_or(false),
                     hello.region.clone(),
+                    client_ip,
                     tx,
                     queued_bytes,
                     now,
                     &state.config,
                 );
+                let ctx = state.ctx();
                 let mut lobby = state.lobby.lock().expect("lobby lock");
+                // Bound lingering sessions for this client (issue #12).
+                lobby.cap_lingering_for_client(&hello.client_id, &ctx, now);
                 lobby.add_session(session)
             }
         }
@@ -260,6 +316,14 @@ async fn handle_socket(socket: WebSocket, state: AppState, ip: IpAddr) {
         };
         match incoming {
             Ok(Message::Text(t)) => {
+                // Text frames are capped at 8 KiB by the spec; reject before
+                // parsing so an oversized frame is never buffered as JSON.
+                if t.len() > MAX_TEXT_FRAME {
+                    if handle_strike(&state, &sid, strike, "text frame too large") {
+                        break;
+                    }
+                    continue;
+                }
                 let text = t.as_str().to_string();
                 let env = match parse_client_message(&text) {
                     Ok(env) => env,
@@ -274,35 +338,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, ip: IpAddr) {
                         continue;
                     }
                     Err(ClientParseError::BadMessage) => {
-                        state.metrics.malformed.inc();
-                        let ctx = state.ctx();
-                        let mut lobby = state.lobby.lock().expect("lobby lock");
-                        lobby.send_error(&sid, ErrorCode::BadMessage, "malformed message", None);
-                        let hash = lobby.sessions.get(&sid).map(|s| s.client_id_hash.clone());
-                        let banned =
-                            lobby
-                                .bans
-                                .record(hash.as_deref(), Some(ip), state.clock.now_ms());
-                        if lobby.note_malformed(&sid, state.clock.now_ms()) {
-                            lobby.remove_session_closing(
-                                &sid,
-                                LeaveReason::Disconnected,
-                                &ctx,
-                                state.clock.now_ms(),
-                                4000,
-                                "too many malformed messages",
-                            );
-                            break;
-                        }
-                        if banned {
-                            lobby.remove_session_closing(
-                                &sid,
-                                LeaveReason::Disconnected,
-                                &ctx,
-                                state.clock.now_ms(),
-                                4000,
-                                "temporarily banned",
-                            );
+                        if handle_strike(&state, &sid, strike, "malformed message") {
                             break;
                         }
                         continue;

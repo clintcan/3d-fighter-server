@@ -2,16 +2,18 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
 use fighter_protocol::clock::Clock;
 use fighter_protocol::json::Severity;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::app::AppState;
 use crate::config::Config;
+use crate::replays::{ReplayJob, ReplayStore};
 
 /// A running server instance bound to a port.
 pub struct Running {
@@ -48,6 +50,11 @@ pub async fn start(config: Config, clock: Arc<dyn Clock>) -> Result<Running> {
             tracing::error!(error = %e, "UDP listener stopped");
         }
     });
+
+    // Replay writes run on a background task, off the lobby lock.
+    if let Some(rx) = state.take_replay_receiver() {
+        tokio::spawn(replay_writer(state.replays.clone(), rx));
+    }
 
     let task_state = state.clone();
     let handle = tokio::spawn(async move {
@@ -101,6 +108,20 @@ async fn spectate_tick(state: AppState) {
         let ctx = state.ctx();
         let mut lobby = state.lobby.lock().expect("lobby lock");
         lobby.flush_spectators(&ctx);
+    }
+}
+
+/// Write queued replays on a blocking thread, off the lobby lock.
+async fn replay_writer(
+    replays: Arc<Mutex<ReplayStore>>,
+    mut rx: mpsc::UnboundedReceiver<ReplayJob>,
+) {
+    while let Some((meta, body)) = rx.recv().await {
+        let store = replays.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            store.lock().expect("replays").save(meta, &body);
+        })
+        .await;
     }
 }
 
