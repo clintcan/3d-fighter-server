@@ -267,8 +267,14 @@ bottom.
   rewriting `buf[8]` to the RELAYED type byte and sending `&buf[8..n]`; the payload
   is never copied. Relay metrics are dedicated `IntCounter`s (no per-packet label
   hashing) and the latency histogram is sampled 1 in 64. Per-source rate-limit maps
-  are already capped. `recvmmsg`/`sendmmsg` batching and `SO_REUSEPORT` sharding are
-  left for a future pass.
+  are already capped.
+- **The UDP socket is drained per wake-up (issue #22).** After `recv_from().await`
+  returns, the loop calls `try_recv_from` until `WouldBlock`, and replies use
+  `try_send_to` with an awaited fallback, so the epoll wake-up and task scheduling
+  are amortised over every datagram queued at that moment. Batching the syscalls
+  themselves (`recvmmsg`/`sendmmsg`) would require `unsafe` or a wrapper crate and
+  is out of scope while the crate is `#![forbid(unsafe_code)]`; multi-core
+  `SO_REUSEPORT` sharding is a future option for a larger host.
 - **The UDP socket sets explicit receive/send buffers (issue #18).** Bound with
   `socket2` at `udp_recv_buffer` / `udp_send_buffer`; the kernel-granted sizes are
   logged, because Linux caps them at `net.core.rmem_max` / `wmem_max`.

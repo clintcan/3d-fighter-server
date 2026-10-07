@@ -471,3 +471,48 @@ async fn match_session_carries_a_shared_pair_secret() {
     assert_eq!(host2, guest2);
     assert_ne!(host_secret, host2, "a new match has a new secret");
 }
+
+// #22: a burst of relay datagrams queued at once is drained and all forwarded.
+#[tokio::test]
+async fn relay_burst_is_drained() {
+    const N: u32 = 200; // within the default per-player burst budget
+
+    let (running, _clock) = start_test().await;
+    let url = running.ws_url();
+    let pair = pair_up(&url, false, false).await;
+    let host_sock = bind_socket(running.udp_addr, pair.host_token, BindRole::Host).await;
+    let guest_sock = bind_socket(running.udp_addr, pair.guest_token, BindRole::Guest).await;
+    let mut host = pair.host;
+    let mut guest = pair.guest;
+    host.recv_type("peer_endpoints").await;
+    guest.recv_type("peer_endpoints").await;
+
+    // Send a burst without waiting for each echo, so many are queued per wake-up.
+    for i in 0..N {
+        let payload = i.to_le_bytes().to_vec();
+        guest_sock
+            .send_to(&relay_datagram(pair.guest_key, payload), running.udp_addr)
+            .await
+            .unwrap();
+    }
+
+    let mut buf = [0u8; 128];
+    let mut seen = vec![false; N as usize];
+    for _ in 0..N {
+        let (n, _) = timeout(Duration::from_secs(3), host_sock.recv_from(&mut buf))
+            .await
+            .expect("forwarded datagram")
+            .unwrap();
+        match UdpDatagram::decode(&buf[..n]).unwrap() {
+            UdpDatagram::Relayed { payload } => {
+                let idx = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+                seen[idx] = true;
+            }
+            other => panic!("expected RELAYED, got {other:?}"),
+        }
+    }
+    assert!(
+        seen.iter().all(|s| *s),
+        "every burst datagram was forwarded"
+    );
+}
