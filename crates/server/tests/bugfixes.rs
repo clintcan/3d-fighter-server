@@ -516,3 +516,52 @@ async fn relay_burst_is_drained() {
         "every burst datagram was forwarded"
     );
 }
+
+// #23: the bounded drain must not starve the lobby under a relay burst.
+#[tokio::test]
+async fn lobby_stays_responsive_during_relay_burst() {
+    let mut config = test_config();
+    // Allow a large burst so the drain actually runs hot.
+    config.limits.relay_datagrams_per_second = 1_000_000;
+    config.limits.relay_bytes_per_second = 1_000_000_000;
+    let (running, _clock) = start_with(config).await;
+    let url = running.ws_url();
+    let pair = pair_up(&url, false, false).await;
+    let host_sock = bind_socket(running.udp_addr, pair.host_token, BindRole::Host).await;
+    let guest_sock = bind_socket(running.udp_addr, pair.guest_token, BindRole::Guest).await;
+    let mut host = pair.host;
+    let mut guest = pair.guest;
+    host.recv_type("peer_endpoints").await;
+    guest.recv_type("peer_endpoints").await;
+
+    // Keep the host socket drained so the server never blocks on a full send
+    // buffer (which would hide the starvation this test targets).
+    let drain = tokio::spawn(async move {
+        let mut buf = [0u8; 256];
+        while host_sock.recv_from(&mut buf).await.is_ok() {}
+    });
+
+    let guest_key = pair.guest_key;
+    let udp_addr = running.udp_addr;
+    let burst = tokio::spawn(async move {
+        for i in 0..20_000u32 {
+            let _ = guest_sock
+                .send_to(
+                    &relay_datagram(guest_key, i.to_le_bytes().to_vec()),
+                    udp_addr,
+                )
+                .await;
+        }
+    });
+
+    // A browser must still get a room list while the relay is saturated.
+    let mut browser = Client::connect(&url, "B", "0.4.1", 111).await;
+    browser.send(json!({"type":"list_rooms"})).await;
+    let rooms = timeout(Duration::from_secs(10), browser.recv_type("rooms"))
+        .await
+        .expect("list_rooms answered during the relay burst");
+    assert_eq!(rooms["type"], "rooms");
+
+    burst.await.ok();
+    drain.abort();
+}
