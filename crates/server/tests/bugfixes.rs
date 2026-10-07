@@ -472,9 +472,9 @@ async fn match_session_carries_a_shared_pair_secret() {
     assert_ne!(host_secret, host2, "a new match has a new secret");
 }
 
-// #22: a burst of relay datagrams queued at once is drained and all forwarded.
+// A burst of relay datagrams queued at once is all forwarded.
 #[tokio::test]
-async fn relay_burst_is_drained() {
+async fn relay_burst_is_forwarded() {
     const N: u32 = 200; // within the default per-player burst budget
 
     let (running, _clock) = start_test().await;

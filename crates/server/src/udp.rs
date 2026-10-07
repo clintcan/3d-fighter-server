@@ -3,18 +3,17 @@
 //! One socket receives every datagram. Relay is handled on the raw buffer with no
 //! per-packet allocation: a RELAY is `[0xF2][key 8][payload]` and a RELAYED is
 //! `[0xF3][payload]`, so forwarding rewrites `buf[8]` to `0xF3` and sends
-//! `&buf[8..n]` (issue #17). After each wake-up the socket is drained with
-//! `try_recv_from` until `WouldBlock`, and replies use `try_send_to` with an
-//! awaited fallback, so the epoll wake-up and task scheduling are amortised over
-//! every datagram queued at that moment (issue #22). Relay and ping never touch
-//! the lobby lock (issue #11); only BIND takes it, briefly, to notify peers. No
-//! reply is ever larger than the datagram that caused it, so the server cannot be
-//! used for amplification.
+//! `&buf[8..n]` (issue #17). Relay and ping never touch the lobby lock (issue
+//! #11); only BIND takes it, briefly, to notify peers. No reply is ever larger
+//! than the datagram that caused it, so the server cannot be used for
+//! amplification.
 //!
-//! Batching the syscalls themselves (`recvmmsg`/`sendmmsg`) would need `unsafe`
-//! or a wrapper crate, and this crate is `#![forbid(unsafe_code)]`; the safe
-//! drain below captures most of the benefit. Multi-core sharding with
-//! `SO_REUSEPORT` is a future option (issue #22, option 3).
+//! A per-wake-up drain (`try_recv_from` until `WouldBlock`) was tried in #22 and
+//! bounded in #23, but measurement showed it saved no CPU and cost a little at
+//! saturation, so it was reverted to one `recv_from().await` per datagram.
+//! Batching the syscalls themselves (`recvmmsg`/`sendmmsg`) would need `unsafe` or
+//! a wrapper crate, and this crate is `#![forbid(unsafe_code)]`; multi-core
+//! `SO_REUSEPORT` sharding is the scaling path for a larger host.
 
 use std::net::SocketAddr;
 
@@ -28,10 +27,6 @@ use crate::config::Config;
 use crate::relay::{BindOutcome, RelayOutcome};
 
 const MAX_DATAGRAM: usize = 2048;
-/// Datagrams processed per wake-up before yielding to the scheduler (issue #23).
-/// `try_recv_from` never parks, so without this bound a steady inflow would
-/// starve the lobby and spectator tasks on a single-core runtime.
-const DRAIN_BATCH: usize = 32;
 
 /// Bind the UDP socket with explicit receive/send buffers (issue #18). Returns
 /// the tokio socket and logs the buffer sizes the kernel actually granted.
@@ -68,7 +63,6 @@ pub async fn serve_socket(socket: UdpSocket, state: AppState) -> Result<()> {
     let mut buf = vec![0u8; MAX_DATAGRAM];
     let mut sample: u64 = 0;
     loop {
-        // Wait for the first datagram (this is where we park on epoll).
         let (n, from) = match socket.recv_from(&mut buf).await {
             Ok(v) => v,
             Err(e) => {
@@ -77,26 +71,6 @@ pub async fn serve_socket(socket: UdpSocket, state: AppState) -> Result<()> {
             }
         };
         process(&socket, &state, &mut buf, n, from, &mut sample).await;
-        // Drain what is already queued without re-arming epoll (issue #22), but
-        // yield every `DRAIN_BATCH` so other tasks are not starved (issue #23).
-        let mut drained = 0usize;
-        loop {
-            match socket.try_recv_from(&mut buf) {
-                Ok((n, from)) => {
-                    process(&socket, &state, &mut buf, n, from, &mut sample).await;
-                    drained += 1;
-                    if drained >= DRAIN_BATCH {
-                        drained = 0;
-                        tokio::task::yield_now().await;
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(e) => {
-                    tracing::debug!(error = %e, "udp drain error");
-                    break;
-                }
-            }
-        }
     }
 }
 
@@ -134,7 +108,7 @@ async fn process(
         match outcome {
             RelayOutcome::Forward { to } => {
                 buf[8] = TYPE_RELAYED;
-                if send_bytes(socket, &buf[8..n], to).await {
+                if socket.send_to(&buf[8..n], to).await.is_ok() {
                     state.metrics.relay_forwarded.inc();
                     state
                         .metrics
@@ -169,23 +143,9 @@ async fn process(
     };
     if let Some((to, bytes)) = handle(state, from, datagram, now) {
         if bytes.len() <= n {
-            send_bytes(socket, &bytes, to).await;
+            let _ = socket.send_to(&bytes, to).await;
         } else {
             tracing::warn!(request = n, reply = bytes.len(), "refused to amplify");
-        }
-    }
-}
-
-/// Send without parking when the socket is writable; await only on `WouldBlock`.
-async fn send_bytes(socket: &UdpSocket, bytes: &[u8], to: SocketAddr) -> bool {
-    match socket.try_send_to(bytes, to) {
-        Ok(_) => true,
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-            socket.send_to(bytes, to).await.is_ok()
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, "udp send error");
-            false
         }
     }
 }
