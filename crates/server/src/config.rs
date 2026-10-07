@@ -33,6 +33,10 @@ pub struct ServerConfig {
     /// `10.0.0.0/8`). Empty means no proxy is trusted and forwarded headers are
     /// ignored.
     pub trusted_proxies: Vec<String>,
+    /// Requested UDP receive/send buffer sizes in bytes (issue #18). The kernel
+    /// caps these at `net.core.rmem_max` / `wmem_max`; the granted size is logged.
+    pub udp_recv_buffer: usize,
+    pub udp_send_buffer: usize,
 }
 
 impl Default for ServerConfig {
@@ -45,6 +49,8 @@ impl Default for ServerConfig {
             log_format: "pretty".into(),
             log_ips: false,
             trusted_proxies: Vec::new(),
+            udp_recv_buffer: 4 * 1024 * 1024,
+            udp_send_buffer: 1024 * 1024,
         }
     }
 }
@@ -121,6 +127,13 @@ pub struct LimitsConfig {
     pub http_max_concurrency: usize,
     pub max_http_connections: usize,
     pub max_rate_limit_sources: usize,
+    /// Per-connection WebSocket buffers (issue #20). Lobby messages are tiny and
+    /// feed frames are under 3 KiB, so small buffers cut per-connection memory.
+    pub ws_read_buffer: usize,
+    pub ws_write_buffer: usize,
+    pub ws_max_write_buffer: usize,
+    /// Close a connection with no frame from the client for this long (#21).
+    pub ws_pong_timeout_ms: u64,
     pub ban_base_ms: u64,
     pub ban_max_ms: u64,
     pub shutdown_grace_ms: u64,
@@ -165,6 +178,10 @@ impl Default for LimitsConfig {
             http_max_concurrency: 256,
             max_http_connections: 10_000,
             max_rate_limit_sources: 10_000,
+            ws_read_buffer: 16 * 1024,
+            ws_write_buffer: 16 * 1024,
+            ws_max_write_buffer: 256 * 1024,
+            ws_pong_timeout_ms: 60_000,
             ban_base_ms: 10 * 60 * 1_000,
             ban_max_ms: 24 * 60 * 60 * 1_000,
             shutdown_grace_ms: 60_000,

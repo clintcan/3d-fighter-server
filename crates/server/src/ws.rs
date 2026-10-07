@@ -66,6 +66,10 @@ pub async fn ws_handler(
     state.metrics.connections_total.inc();
     ws.max_message_size(MAX_BINARY_FRAME)
         .max_frame_size(MAX_BINARY_FRAME)
+        // Small per-connection buffers cut idle memory (issue #20).
+        .read_buffer_size(state.config.limits.ws_read_buffer)
+        .write_buffer_size(state.config.limits.ws_write_buffer)
+        .max_write_buffer_size(state.config.limits.ws_max_write_buffer)
         .protocols([SUBPROTOCOL])
         .on_upgrade(move |socket| async move {
             handle_socket(socket, state.clone(), client_ip, strike).await;
@@ -310,7 +314,20 @@ async fn handle_socket(
     );
 
     loop {
-        let incoming = stream.next().await;
+        // Close a connection that stops answering (issue #21): a vanished client
+        // behind a proxy never fails our Ping send, so rely on the missing reply.
+        let incoming = match tokio::time::timeout(
+            Duration::from_millis(state.config.limits.ws_pong_timeout_ms),
+            stream.next(),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(_) => {
+                tracing::debug!(session_id = %sid, "closing idle connection");
+                break;
+            }
+        };
         let Some(incoming) = incoming else {
             break;
         };

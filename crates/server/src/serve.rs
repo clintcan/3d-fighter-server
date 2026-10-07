@@ -44,7 +44,7 @@ pub async fn start(config: Config, clock: Arc<dyn Clock>) -> Result<Running> {
     let state = AppState::new(config, clock, started_ms);
     let listener = tokio::net::TcpListener::bind(&state.config.server.http_bind).await?;
     let addr = listener.local_addr()?;
-    let udp_socket = tokio::net::UdpSocket::bind(&state.config.server.udp_bind).await?;
+    let udp_socket = crate::udp::bind_socket(&state.config)?;
     let udp_addr = udp_socket.local_addr()?;
     let router = crate::http::router(state.clone());
 

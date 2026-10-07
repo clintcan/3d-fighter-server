@@ -1934,18 +1934,19 @@ impl Lobby {
         // Binary frames are activity too: a host publishing the feed for a whole
         // round must not be treated as idle.
         self.touch(sid, now);
-        let Some((room_id, is_host)) = self.rooms.values().find_map(|r| {
-            if r.host == sid {
-                Some((r.id.clone(), true))
-            } else if r.guest.as_deref() == Some(sid) {
-                Some((r.id.clone(), false))
-            } else {
-                None
-            }
-        }) else {
+        // O(1) lookup via the session, not a scan over every room (issue #19).
+        let (Some(room_id), Some(role)) = (
+            self.sessions.get(sid).and_then(|s| s.room.clone()),
+            self.sessions.get(sid).and_then(|s| s.role),
+        ) else {
             self.send_error(sid, ErrorCode::NotAllowed, "not in a match", None);
             return ConnAction::None;
         };
+        let is_host = role == Role::Host;
+        if !is_host && role != Role::Guest {
+            self.send_error(sid, ErrorCode::NotAllowed, "not in a match", None);
+            return ConnAction::None;
+        }
         if is_host && self.rooms[&room_id].guest.is_none() {
             self.send_error(sid, ErrorCode::NotAllowed, "no guest", None);
             return ConnAction::None;

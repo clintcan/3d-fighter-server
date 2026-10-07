@@ -21,10 +21,10 @@ pub struct Metrics {
     pub bans: IntCounter,
     #[allow(dead_code)]
     pub feed_frames: IntCounterVec,
-    #[allow(dead_code)]
-    pub relay_packets: IntCounterVec,
-    #[allow(dead_code)]
-    pub relay_bytes: IntCounterVec,
+    /// Dedicated relay counters (no label lookup per packet, issue #17).
+    pub relay_forwarded: IntCounter,
+    pub relay_dropped: IntCounter,
+    pub relay_forwarded_bytes: IntCounter,
     pub spectators: IntGauge,
     #[allow(dead_code)]
     pub matches: IntCounterVec,
@@ -78,16 +78,14 @@ impl Metrics {
             &["type"],
         )
         .expect("metric");
-        let relay_packets = IntCounterVec::new(
-            prometheus::Opts::new("fighter_relay_packets_total", "Relay datagrams"),
-            &["direction"],
-        )
-        .expect("metric");
-        let relay_bytes = IntCounterVec::new(
-            prometheus::Opts::new("fighter_relay_bytes_total", "Relay bytes"),
-            &["direction"],
-        )
-        .expect("metric");
+        let relay_forwarded =
+            IntCounter::new("fighter_relay_packets_total", "Relay datagrams forwarded")
+                .expect("metric");
+        let relay_dropped =
+            IntCounter::new("fighter_relay_dropped_total", "Relay datagrams dropped")
+                .expect("metric");
+        let relay_forwarded_bytes =
+            IntCounter::new("fighter_relay_bytes_total", "Relay bytes forwarded").expect("metric");
         let spectators = IntGauge::new("fighter_spectators", "Active spectators").expect("metric");
         let matches = IntCounterVec::new(
             prometheus::Opts::new("fighter_matches_total", "Matches by outcome"),
@@ -122,8 +120,9 @@ impl Metrics {
             Box::new(malformed.clone()),
             Box::new(bans.clone()),
             Box::new(feed_frames.clone()),
-            Box::new(relay_packets.clone()),
-            Box::new(relay_bytes.clone()),
+            Box::new(relay_forwarded.clone()),
+            Box::new(relay_dropped.clone()),
+            Box::new(relay_forwarded_bytes.clone()),
             Box::new(spectators.clone()),
             Box::new(matches.clone()),
             Box::new(relay_latency.clone()),
@@ -145,8 +144,9 @@ impl Metrics {
             malformed,
             bans,
             feed_frames,
-            relay_packets,
-            relay_bytes,
+            relay_forwarded,
+            relay_dropped,
+            relay_forwarded_bytes,
             spectators,
             matches,
             relay_latency,

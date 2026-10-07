@@ -260,3 +260,24 @@ bottom.
   the same public IP cannot win the race. It is never logged or placed in
   `room_state`, `peer_endpoints` or metrics, and is cleared when the guest leaves
   so the next match gets a fresh one.
+
+## Performance (load-test review)
+
+- **Relay forwarding is allocation-free (issue #17).** A RELAY is forwarded by
+  rewriting `buf[8]` to the RELAYED type byte and sending `&buf[8..n]`; the payload
+  is never copied. Relay metrics are dedicated `IntCounter`s (no per-packet label
+  hashing) and the latency histogram is sampled 1 in 64. Per-source rate-limit maps
+  are already capped. `recvmmsg`/`sendmmsg` batching and `SO_REUSEPORT` sharding are
+  left for a future pass.
+- **The UDP socket sets explicit receive/send buffers (issue #18).** Bound with
+  `socket2` at `udp_recv_buffer` / `udp_send_buffer`; the kernel-granted sizes are
+  logged, because Linux caps them at `net.core.rmem_max` / `wmem_max`.
+- **The feed hot path is O(1) per frame (issue #19).** `handle_binary` looks up the
+  room through the session's `room` field instead of scanning every room, removing
+  the O(rooms) work that dominated ingest at scale.
+- **WebSocket buffers are small and bounded (issue #20).** `read_buffer_size`,
+  `write_buffer_size` and `max_write_buffer_size` are set per connection; lobby
+  messages are tiny and feed frames are under 3 KiB.
+- **Idle connections are closed (issue #21).** The read loop times out after
+  `ws_pong_timeout_ms` (default 60 s) with no frame from the client, so a vanished
+  client behind a proxy is dropped even though the server's Ping send succeeds.
