@@ -169,7 +169,7 @@ host                                   server                                spe
 | `leave_room` | — | host, guest or spectator | A host leaving closes the room (`room_closed`). A guest leaving reopens it. |
 | `room_update` | `phase: "lobby" \| "character_select" \| "stage_select" \| "in_match" \| "results"`, `fighters?: [string\|null, string\|null]` (P1, P2 ids), `stage?: string`, `round?: u8`, `wins?: [u8, u8]`, `timer?: u8` | host | Updates the room listing; broadcast to members and spectators as `room_state`. At most 4 per second (coalesce, keep the newest). |
 | `connection_report` | `path: "direct" \| "relay"`, `rtt_ms?: u16` | host, guest | Recorded for metrics and shown in `room_state`. |
-| `spectate` | `room: string` (id or code), `password?: string` | not in a room | Room must allow spectators and have room. Returns `spectate_started`, then binary feed frames. |
+| `spectate` | `room: string` (id or code), `password?: string` | not in a room | Room must allow spectators and have room. Returns `spectate_started`, then binary feed frames. Rate-limited with `join_room` (section 10.2), and a wrong password or unknown code counts toward strikes (section 10.3). |
 | `stop_spectating` | — | spectator | |
 | `react` | `emote: "clap" \| "fire" \| "wow" \| "laugh" \| "gg" \| "ouch"` | members and spectators | Rate limit 1 per 2 s per client; broadcast as `reaction` to everyone in the room. |
 | `queue_join` | `mode: "casual"`, `region?: string` | not in a room | Quick match (milestone 5). |
@@ -350,7 +350,7 @@ The host sends `MATCH_END` once the result is confirmed (no rollback can change 
 | `POST /admin/ban` | bearer | `{client_id_hash?, ip?, minutes}`: rejects matching `hello`s with `not_allowed`. |
 | `GET /admin/rooms` | bearer | Full room list including codes, connection paths and spectator counts. |
 
-Admin endpoints are disabled unless `admin_token` is configured. Compare the token in constant time.
+Admin endpoints are disabled unless `admin_token` is configured. Compare the token in constant time. Failed admin auth is counted per client address and locked out after a handful of attempts (section 10.2), and every admin action is logged with its parameters and the caller's address.
 
 ---
 
@@ -380,6 +380,7 @@ Admin endpoints are disabled unless `admin_token` is configured. Compare the tok
 | Relay per player | 200 datagrams per second, 64 KiB/s |
 | Idle room (host only, no activity) | closed after 30 minutes |
 | Pending join request | 30 s |
+| Admin auth failures per address | 10, then a 5-minute lockout |
 
 `welcome.limits` tells the client the values it needs: `max_room_name`, `max_spectators`, `reaction_interval_ms`.
 

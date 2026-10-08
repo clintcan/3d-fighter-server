@@ -281,6 +281,22 @@ bottom.
   so it cannot close the resumed connection. `try_resume` also increments
   `online.players` only when the session was actually disconnected, so a live →
   live takeover does not double-count.
+- **`spectate` shares the join rate limit and failures count toward strikes
+  (issue #26).** `handle_spectate` takes a token from the same
+  `create_join_bucket` as `join_room` before resolving the room, so room passwords
+  and codes cannot be brute-forced faster through spectate than through join. A
+  wrong password or an unknown room records an auth failure, and one ban strike is
+  issued per three failures within a minute, so a player who mistypes twice is not
+  punished while a guessing loop is throttled and eventually banned.
+- **Admin hardening (issue #27).** Failed admin auth is counted per client address
+  (`admin_max_failures`, default 10) and locks the address out for
+  `admin_lockout_ms` (default 5 minutes), returning 429; failures are logged
+  without the token. Every admin action logs its parameters and the caller's
+  address. Per-IP limits and bans key IPv6 addresses by their /64 prefix
+  (`key_ip`), and IPv4-mapped IPv6 addresses are treated as IPv4, so an IPv6 client
+  cannot dodge limits by rotating within its /64. Trusted-proxy entries accept
+  IPv6 CIDR too. All HTTP responses carry `X-Content-Type-Options: nosniff`, and
+  `/admin/*` carries `Cache-Control: no-store`.
 
 ## Performance (load-test review)
 

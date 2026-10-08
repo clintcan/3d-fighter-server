@@ -306,6 +306,7 @@ async fn handle_socket(
                     hello.relay_only.unwrap_or(false),
                     hello.region.clone(),
                     client_ip,
+                    strike,
                     conn_id,
                     tx,
                     queued_bytes,

@@ -91,6 +91,8 @@ pub struct Session {
     pub region: Option<String>,
     /// Resolved client address (peer, or forwarded behind a trusted proxy).
     pub client_ip: std::net::IpAddr,
+    /// The address an IP-based strike is recorded against (None for local peers).
+    pub strike_ip: Option<std::net::IpAddr>,
     pub out: Option<UnboundedSender<OutMsg>>,
     pub room: Option<String>,
     pub role: Option<Role>,
@@ -110,6 +112,9 @@ pub struct Session {
     create_join_bucket: TokenBucket,
     react_bucket: TokenBucket,
     malformed: VecDeque<u64>,
+    /// Timestamps of recent failed auth attempts (wrong password / unknown room),
+    /// used to issue a strike per few failures (issue #26).
+    auth_failures: VecDeque<u64>,
 }
 
 impl Session {
@@ -123,6 +128,7 @@ impl Session {
         relay_only: bool,
         region: Option<String>,
         client_ip: std::net::IpAddr,
+        strike_ip: Option<std::net::IpAddr>,
         conn_id: u64,
         out: UnboundedSender<OutMsg>,
         queued_bytes: Arc<AtomicUsize>,
@@ -140,6 +146,7 @@ impl Session {
             relay_only,
             region,
             client_ip,
+            strike_ip,
             out: Some(out),
             room: None,
             role: None,
@@ -166,6 +173,7 @@ impl Session {
             ),
             react_bucket: TokenBucket::new(1, 1000.0 / l.reaction_interval_ms.max(1) as f64),
             malformed: VecDeque::new(),
+            auth_failures: VecDeque::new(),
         }
     }
 
@@ -360,6 +368,40 @@ impl Lobby {
     pub fn touch(&mut self, sid: &str, now: u64) {
         if let Some(sess) = self.sessions.get_mut(sid) {
             sess.last_seen_ms = now;
+        }
+    }
+
+    /// Count a failed auth attempt (wrong password or unknown room) and issue one
+    /// ban strike per three failures within a minute (issue #26). A player who
+    /// mistypes a couple of times is not punished.
+    fn record_auth_failure(&mut self, sid: &str, now: u64) {
+        const WINDOW_MS: u64 = 60_000;
+        const PER_STRIKE: usize = 3;
+        let (hash, ip) = match self.sessions.get(sid) {
+            Some(s) => (s.client_id_hash.clone(), s.strike_ip),
+            None => return,
+        };
+        let strike = {
+            let Some(s) = self.sessions.get_mut(sid) else {
+                return;
+            };
+            s.auth_failures.push_back(now);
+            while let Some(front) = s.auth_failures.front() {
+                if now.saturating_sub(*front) > WINDOW_MS {
+                    s.auth_failures.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if s.auth_failures.len() >= PER_STRIKE {
+                s.auth_failures.clear();
+                true
+            } else {
+                false
+            }
+        };
+        if strike {
+            self.bans.record(Some(&hash), ip, now);
         }
     }
 
@@ -1041,6 +1083,7 @@ impl Lobby {
         }
 
         let Some(room_id) = self.resolve_room(&m.room) else {
+            self.record_auth_failure(sid, now);
             self.send_error(sid, ErrorCode::RoomNotFound, "room not found", rid);
             return;
         };
@@ -1049,6 +1092,7 @@ impl Lobby {
             (s.client_id.clone(), s.game_version.clone(), s.content_hash)
         };
 
+        let mut wrong_password = false;
         {
             let room = &self.rooms[&room_id];
             if room.host_game_version != viewer_version || room.host_content_hash != viewer_hash {
@@ -1087,10 +1131,14 @@ impl Lobby {
                     .map(|p| ct_eq(&hash_password(p), &hash))
                     .unwrap_or(false);
                 if !ok {
-                    self.send_error(sid, ErrorCode::WrongPassword, "wrong password", rid);
-                    return;
+                    wrong_password = true;
                 }
             }
+        }
+        if wrong_password {
+            self.record_auth_failure(sid, now);
+            self.send_error(sid, ErrorCode::WrongPassword, "wrong password", rid);
+            return;
         }
 
         let request_id = generate_hex_token(8);
@@ -1455,18 +1503,32 @@ impl Lobby {
     }
 
     fn handle_spectate(&mut self, sid: &str, m: Spectate, rid: Option<&str>, ctx: &Ctx, now: u64) {
-        let Some(sess) = self.sessions.get(sid) else {
-            return;
+        let (in_room, viewer_version, viewer_hash) = match self.sessions.get(sid) {
+            Some(s) => (s.room.is_some(), s.game_version.clone(), s.content_hash),
+            None => return,
         };
-        if sess.room.is_some() {
+        if in_room {
             self.send_error(sid, ErrorCode::AlreadyInRoom, "already in a room", rid);
             return;
         }
-        let (viewer_version, viewer_hash) = (sess.game_version.clone(), sess.content_hash);
+        // Spectate shares the join budget, so passwords and codes cannot be
+        // brute-forced faster here than through join_room (issue #26).
+        let allowed = self
+            .sessions
+            .get_mut(sid)
+            .map(|s| s.create_join_bucket.try_acquire(now))
+            .unwrap_or(false);
+        if !allowed {
+            ctx.metrics.rate_limited.inc();
+            self.send_error(sid, ErrorCode::RateLimited, "too many requests", rid);
+            return;
+        }
         let Some(room_id) = self.resolve_room(&m.room) else {
+            self.record_auth_failure(sid, now);
             self.send_error(sid, ErrorCode::RoomNotFound, "room not found", rid);
             return;
         };
+        let mut wrong_password = false;
         {
             let room = &self.rooms[&room_id];
             // A spectator re-simulates the match, so the build and data must
@@ -1500,10 +1562,14 @@ impl Lobby {
                     .map(|p| ct_eq(&hash_password(p), &hash))
                     .unwrap_or(false);
                 if !ok {
-                    self.send_error(sid, ErrorCode::WrongPassword, "wrong password", rid);
-                    return;
+                    wrong_password = true;
                 }
             }
+        }
+        if wrong_password {
+            self.record_auth_failure(sid, now);
+            self.send_error(sid, ErrorCode::WrongPassword, "wrong password", rid);
+            return;
         }
         let (delay, live) = {
             let room = self.rooms.get_mut(&room_id).expect("room exists");
@@ -2789,6 +2855,7 @@ mod tests {
             false,
             None,
             "127.0.0.1".parse().unwrap(),
+            None,
             0,
             tx,
             Arc::new(AtomicUsize::new(0)),

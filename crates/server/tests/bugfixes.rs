@@ -693,3 +693,166 @@ async fn resume_over_live_socket_takes_over() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(online_of(&mut watcher).await["players"], 1);
 }
+
+// #26: spectate must be rate limited like join_room, and failures must strike.
+#[tokio::test]
+async fn spectate_wrong_password_is_rate_limited() {
+    let (running, _clock) = start_test().await;
+    let url = running.ws_url();
+    let mut host = Client::connect(&url, "H", "0.4.1", 111).await;
+    host.send(json!({
+        "type":"create_room","visibility":"public","allow_spectators":true,"password":"secret1"
+    }))
+    .await;
+    let code = host.recv_type("room_created").await["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut attacker = Client::connect(&url, "A", "0.4.1", 111).await;
+    let mut rate_limited = false;
+    for _ in 0..8 {
+        attacker
+            .send(json!({"type":"spectate","room":code,"password":"wrong"}))
+            .await;
+        let v = attacker.recv_type("error").await;
+        if v["code"] == "rate_limited" {
+            rate_limited = true;
+            break;
+        }
+        assert_eq!(v["code"], "wrong_password");
+    }
+    assert!(rate_limited, "spectate must be rate limited like join_room");
+}
+
+#[tokio::test]
+async fn typos_then_correct_password_still_works() {
+    let (running, _clock) = start_test().await;
+    let url = running.ws_url();
+    let mut host = Client::connect(&url, "H", "0.4.1", 111).await;
+    host.send(json!({
+        "type":"create_room","visibility":"public","allow_spectators":true,"password":"secret1"
+    }))
+    .await;
+    let code = host.recv_type("room_created").await["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let mut spec = Client::connect(&url, "S", "0.4.1", 111).await;
+    for _ in 0..2 {
+        spec.send(json!({"type":"spectate","room":code,"password":"nope"}))
+            .await;
+        assert_eq!(spec.recv_type("error").await["code"], "wrong_password");
+    }
+    spec.send(json!({"type":"spectate","room":code,"password":"secret1"}))
+        .await;
+    spec.recv_type("spectate_started").await;
+}
+
+#[tokio::test]
+async fn repeated_wrong_passwords_get_banned() {
+    let (running, clock) = start_test().await;
+    let url = running.ws_url();
+    let mut host = Client::connect(&url, "H", "0.4.1", 111).await;
+    host.send(json!({
+        "type":"create_room","visibility":"public","allow_spectators":true,"password":"secret1"
+    }))
+    .await;
+    let code = host.recv_type("room_created").await["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let hello = |cid: &str| {
+        json!({
+            "type":"hello","protocol":1,"game_version":"0.4.1","content_hash":111,
+            "client_id":cid,"name":"Bad"
+        })
+    };
+    let mut attacker = Client::hello_raw(&url, hello("attacker")).await;
+    attacker.recv_type("welcome").await;
+
+    // One strike per three failures; ten strikes is a ban. Advance past the
+    // minute window between rounds so the bucket refills and failures do not
+    // carry over.
+    for _ in 0..10 {
+        for _ in 0..3 {
+            attacker
+                .send(json!({"type":"spectate","room":code,"password":"wrong"}))
+                .await;
+            let _ = attacker.recv_type("error").await;
+        }
+        clock.advance(61_000);
+    }
+
+    // A fresh connection with the same client id is now refused.
+    let mut fresh = Client::hello_raw(&url, hello("attacker")).await;
+    let first = fresh.recv().await;
+    assert_eq!(first["type"], "error");
+    assert_eq!(first["code"], "not_allowed");
+}
+// #27: admin auth locks out after repeated failures.
+#[tokio::test]
+async fn admin_auth_lockout() {
+    let mut config = test_config();
+    config.admin.token = Some("secret-token".into());
+    let (running, _clock) = start_with(config).await;
+
+    let mut saw_429 = false;
+    for _ in 0..12 {
+        let (status, _) = http_request(
+            running.addr,
+            "GET",
+            "/admin/rooms",
+            &[("Authorization", "Bearer wrong")],
+            "",
+        )
+        .await;
+        if status == 429 {
+            saw_429 = true;
+        }
+    }
+    assert!(
+        saw_429,
+        "admin auth should lock out after repeated failures"
+    );
+
+    // The right token is also refused while locked out.
+    let (status, _) = http_request(
+        running.addr,
+        "GET",
+        "/admin/rooms",
+        &[("Authorization", "Bearer secret-token")],
+        "",
+    )
+    .await;
+    assert_eq!(status, 429);
+}
+
+// #27: security headers are present.
+#[tokio::test]
+async fn security_headers_present() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn raw(addr: std::net::SocketAddr, path: &str) -> String {
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        s.read_to_end(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf).to_lowercase()
+    }
+
+    let (running, _clock) = start_test().await;
+    let health = raw(running.addr, "/healthz").await;
+    assert!(
+        health.contains("x-content-type-options: nosniff"),
+        "missing nosniff: {health}"
+    );
+    let admin = raw(running.addr, "/admin/rooms").await;
+    assert!(
+        admin.contains("cache-control: no-store"),
+        "missing no-store on /admin: {admin}"
+    );
+}

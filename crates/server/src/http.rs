@@ -1,12 +1,14 @@
 //! HTTP endpoints: `/healthz`, `/metrics`, `/v1/rooms`, `/v1/regions`,
 //! `/v1/replays` and the authenticated `/admin/*` API (section 9).
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::extract::connect_info::ConnectInfo;
+use axum::extract::{Path, Request, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -17,6 +19,7 @@ use tower::limit::ConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 
 use crate::app::AppState;
+use crate::proxy::resolve_client_ip;
 use crate::ws::ws_handler;
 
 pub fn router(state: AppState) -> Router {
@@ -40,7 +43,24 @@ pub fn router(state: AppState) -> Router {
             timeout,
         ))
         .layer(ConcurrencyLimitLayer::new(concurrency))
+        .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
+}
+
+/// Security headers on every response (issue #27).
+async fn security_headers(req: Request, next: Next) -> Response {
+    let is_admin = req.uri().path().starts_with("/admin");
+    let mut response = next.run(req).await;
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    if is_admin {
+        response
+            .headers_mut()
+            .insert("cache-control", HeaderValue::from_static("no-store"));
+    }
+    response
 }
 
 async fn healthz(State(state): State<AppState>) -> Response {
@@ -51,10 +71,16 @@ async fn healthz(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn metrics(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
     // When an admin token is configured, /metrics requires it too (issue #10).
-    if state.admin_token.is_some() && admin_ok(&state, &headers).is_some() {
-        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    if state.admin_token.is_some() {
+        if let Some(e) = admin_ok(&state, &headers, peer.ip()) {
+            return e;
+        }
     }
     (
         StatusCode::OK,
@@ -178,27 +204,54 @@ async fn replay_get(State(state): State<AppState>, Path(id): Path<String>) -> Re
     }
 }
 
-/// `None` when authorized, otherwise the error response to return.
-fn admin_ok(state: &AppState, headers: &HeaderMap) -> Option<Response> {
+/// `None` when authorized, otherwise the error response to return. Failed
+/// attempts are counted per client address and locked out (issue #27).
+fn admin_ok(state: &AppState, headers: &HeaderMap, peer: IpAddr) -> Option<Response> {
     let Some(token) = &state.admin_token else {
         return Some((StatusCode::NOT_FOUND, "admin disabled").into_response());
     };
+    let ip = resolve_client_ip(peer, headers, &state.trusted_proxies);
+    let now = state.clock.now_ms();
+    if state.admin_locked(ip, now) {
+        return Some((StatusCode::TOO_MANY_REQUESTS, "too many attempts").into_response());
+    }
     let provided = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
     match provided {
-        Some(p) if bool::from(p.as_bytes().ct_eq(token.as_bytes())) => None,
-        _ => Some((StatusCode::UNAUTHORIZED, "unauthorized").into_response()),
+        Some(p) if bool::from(p.as_bytes().ct_eq(token.as_bytes())) => {
+            state.admin_success(ip);
+            None
+        }
+        _ => {
+            let locked = state.note_admin_failure(ip, now);
+            if state.config.server.log_ips {
+                tracing::warn!(client = %ip, "admin auth failed");
+            } else {
+                tracing::warn!("admin auth failed");
+            }
+            let status = if locked {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::UNAUTHORIZED
+            };
+            Some((status, "unauthorized").into_response())
+        }
     }
+}
+
+fn admin_client_ip(state: &AppState, headers: &HeaderMap, peer: IpAddr) -> IpAddr {
+    resolve_client_ip(peer, headers, &state.trusted_proxies)
 }
 
 async fn admin_notice(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Some(e) = admin_ok(&state, &headers) {
+    if let Some(e) = admin_ok(&state, &headers, peer.ip()) {
         return e;
     }
     let message = body["message"]
@@ -211,6 +264,12 @@ async fn admin_notice(
         Some("warning") => Severity::Warning,
         _ => Severity::Info,
     };
+    tracing::info!(
+        client = %admin_client_ip(&state, &headers, peer.ip()),
+        len = message.chars().count(),
+        ?severity,
+        "admin notice"
+    );
     state
         .lobby
         .lock()
@@ -219,8 +278,12 @@ async fn admin_notice(
     StatusCode::OK.into_response()
 }
 
-async fn admin_rooms(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Some(e) = admin_ok(&state, &headers) {
+async fn admin_rooms(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(e) = admin_ok(&state, &headers, peer.ip()) {
         return e;
     }
     let rooms = state.lobby.lock().expect("lobby lock").admin_rooms();
@@ -229,10 +292,11 @@ async fn admin_rooms(State(state): State<AppState>, headers: HeaderMap) -> Respo
 
 async fn admin_close(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Some(e) = admin_ok(&state, &headers) {
+    if let Some(e) = admin_ok(&state, &headers, peer.ip()) {
         return e;
     }
     let ctx = state.ctx();
@@ -242,6 +306,12 @@ async fn admin_close(
         .lock()
         .expect("lobby lock")
         .admin_close_room(&id, &ctx, now);
+    tracing::info!(
+        client = %admin_client_ip(&state, &headers, peer.ip()),
+        room_id = %id,
+        closed,
+        "admin close room"
+    );
     if closed {
         StatusCode::OK.into_response()
     } else {
@@ -251,16 +321,24 @@ async fn admin_close(
 
 async fn admin_ban(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Some(e) = admin_ok(&state, &headers) {
+    if let Some(e) = admin_ok(&state, &headers, peer.ip()) {
         return e;
     }
     let minutes = body["minutes"].as_u64().unwrap_or(10);
     let hash = body["client_id_hash"].as_str();
     let ip: Option<IpAddr> = body["ip"].as_str().and_then(|s| s.parse().ok());
     let now = state.clock.now_ms();
+    tracing::info!(
+        client = %admin_client_ip(&state, &headers, peer.ip()),
+        client_id_hash = ?hash,
+        target_ip = ?ip,
+        minutes,
+        "admin ban"
+    );
     state
         .lobby
         .lock()

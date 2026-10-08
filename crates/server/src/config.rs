@@ -127,6 +127,9 @@ pub struct LimitsConfig {
     pub http_max_concurrency: usize,
     pub max_http_connections: usize,
     pub max_rate_limit_sources: usize,
+    /// Admin auth: failures per address before a lockout, and the lockout length.
+    pub admin_max_failures: u32,
+    pub admin_lockout_ms: u64,
     /// Per-connection WebSocket buffers (issue #20). Lobby messages are tiny and
     /// feed frames are under 3 KiB, so small buffers cut per-connection memory.
     pub ws_read_buffer: usize,
@@ -178,6 +181,8 @@ impl Default for LimitsConfig {
             http_max_concurrency: 256,
             max_http_connections: 10_000,
             max_rate_limit_sources: 10_000,
+            admin_max_failures: 10,
+            admin_lockout_ms: 5 * 60 * 1_000,
             ws_read_buffer: 16 * 1024,
             ws_write_buffer: 16 * 1024,
             ws_max_write_buffer: 256 * 1024,

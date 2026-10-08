@@ -7,30 +7,42 @@
 //! no proxy is trusted, so a shared address (a LAN, or Caddy on localhost) is
 //! not banned wholesale.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use axum::http::HeaderMap;
 
-/// A trusted proxy address or IPv4 CIDR block.
+/// A trusted proxy address or CIDR block (IPv4 or IPv6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IpAllow {
     Exact(IpAddr),
     V4 { base: u32, prefix: u8 },
+    V6 { base: u128, prefix: u8 },
 }
 
 impl IpAllow {
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim();
         if let Some((addr, prefix)) = s.split_once('/') {
-            let ip: Ipv4Addr = addr.parse().ok()?;
             let prefix: u8 = prefix.parse().ok()?;
-            if prefix > 32 {
-                return None;
+            if let Ok(v4) = addr.parse::<Ipv4Addr>() {
+                if prefix > 32 {
+                    return None;
+                }
+                return Some(IpAllow::V4 {
+                    base: u32::from(v4),
+                    prefix,
+                });
             }
-            return Some(IpAllow::V4 {
-                base: u32::from(ip),
-                prefix,
-            });
+            if let Ok(v6) = addr.parse::<Ipv6Addr>() {
+                if prefix > 128 {
+                    return None;
+                }
+                return Some(IpAllow::V6 {
+                    base: u128::from(v6),
+                    prefix,
+                });
+            }
+            return None;
         }
         s.parse::<IpAddr>().ok().map(IpAllow::Exact)
     }
@@ -40,15 +52,54 @@ impl IpAllow {
             IpAllow::Exact(a) => *a == ip,
             IpAllow::V4 { base, prefix } => match ip {
                 IpAddr::V4(v4) => {
-                    let mask = if *prefix == 0 {
-                        0
-                    } else {
-                        u32::MAX << (32 - *prefix)
-                    };
+                    let mask = v4_mask(*prefix);
                     (u32::from(v4) & mask) == (*base & mask)
                 }
                 IpAddr::V6(_) => false,
             },
+            IpAllow::V6 { base, prefix } => match ip {
+                IpAddr::V6(v6) => {
+                    let mask = v6_mask(*prefix);
+                    (u128::from(v6) & mask) == (*base & mask)
+                }
+                IpAddr::V4(_) => false,
+            },
+        }
+    }
+}
+
+fn v4_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    }
+}
+
+fn v6_mask(prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    }
+}
+
+/// Normalise an address to the key used for per-IP limits and bans: IPv4 stays
+/// as-is, an IPv4-mapped IPv6 address becomes IPv4, and any other IPv6 address
+/// is reduced to its /64 prefix (issue #27).
+pub fn key_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                IpAddr::V4(v4)
+            } else {
+                let mut octets = v6.octets();
+                for b in octets[8..].iter_mut() {
+                    *b = 0;
+                }
+                IpAddr::V6(Ipv6Addr::from(octets))
+            }
         }
     }
 }
@@ -71,12 +122,24 @@ pub fn is_private_or_loopback(ip: IpAddr) -> bool {
                 || v4.is_unspecified()
                 || v4.octets()[0] == 0
         }
-        IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.octets()[0] & 0xfe) == 0xfc // unique local fc00::/7
+                || (v6.octets()[0] == 0xfe && (v6.octets()[1] & 0xc0) == 0x80) // link-local fe80::/10
+        }
     }
 }
 
-/// Resolve the client address from the peer and forwarded headers.
+/// Resolve the client address from the peer and forwarded headers. The result is
+/// already normalised with [`key_ip`] (IPv6 reduced to /64), so it is the right
+/// key for per-IP limits and bans.
 pub fn resolve_client_ip(peer: IpAddr, headers: &HeaderMap, trusted: &[IpAllow]) -> IpAddr {
+    let raw = resolve_raw_client_ip(peer, headers, trusted);
+    key_ip(raw)
+}
+
+fn resolve_raw_client_ip(peer: IpAddr, headers: &HeaderMap, trusted: &[IpAllow]) -> IpAddr {
     if !is_trusted(trusted, peer) {
         return peer;
     }
@@ -108,11 +171,11 @@ pub fn resolve_client_ip(peer: IpAddr, headers: &HeaderMap, trusted: &[IpAllow])
 pub fn strike_ip(peer: IpAddr, client_ip: IpAddr, trusted: &[IpAllow]) -> Option<IpAddr> {
     if is_trusted(trusted, peer) {
         // Never ban the proxy itself; only the forwarded client.
-        (client_ip != peer).then_some(client_ip)
+        (client_ip != key_ip(peer)).then_some(client_ip)
     } else if is_private_or_loopback(peer) {
         None
     } else {
-        Some(peer)
+        Some(client_ip)
     }
 }
 
@@ -171,5 +234,23 @@ mod tests {
             strike_ip(ip("203.0.113.9"), ip("203.0.113.9"), &trusted),
             Some(ip("203.0.113.9"))
         );
+    }
+
+    #[test]
+    fn ipv6_is_keyed_by_slash64() {
+        let a: IpAddr = "2001:db8:1:2:3:4:5:6".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:ffff::1".parse().unwrap();
+        assert_eq!(key_ip(a), key_ip(b));
+        let mapped: IpAddr = "::ffff:203.0.113.5".parse().unwrap();
+        assert_eq!(key_ip(mapped), ip("203.0.113.5"));
+    }
+
+    #[test]
+    fn v6_cidr_matches() {
+        let cidr = IpAllow::parse("2001:db8::/32").unwrap();
+        assert!(cidr.contains("2001:db8:1:2::1".parse().unwrap()));
+        assert!(!cidr.contains("2001:db9::1".parse().unwrap()));
+        let exact = IpAllow::parse("2001:db8::1").unwrap();
+        assert!(exact.contains("2001:db8::1".parse().unwrap()));
     }
 }

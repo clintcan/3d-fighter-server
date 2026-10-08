@@ -37,6 +37,15 @@ pub struct AppState {
     conn_total: Arc<AtomicUsize>,
     conn_per_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
     replay_rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<ReplayJob>>>>,
+    admin_failures: Arc<Mutex<HashMap<IpAddr, AdminFail>>>,
+}
+
+/// Failed admin-auth attempts for one address (issue #27).
+#[derive(Debug, Clone, Copy)]
+struct AdminFail {
+    count: u32,
+    window_start: u64,
+    locked_until: u64,
 }
 
 impl AppState {
@@ -83,6 +92,7 @@ impl AppState {
             conn_total: Arc::new(AtomicUsize::new(0)),
             conn_per_ip: Arc::new(Mutex::new(HashMap::new())),
             replay_rx: Arc::new(Mutex::new(Some(replay_rx))),
+            admin_failures: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -95,6 +105,48 @@ impl AppState {
     /// life of the connection, so incomplete requests count too.
     pub fn try_acquire_http(&self) -> Option<OwnedSemaphorePermit> {
         self.http_semaphore.clone().try_acquire_owned().ok()
+    }
+
+    /// Whether admin auth from `ip` is currently locked out (issue #27).
+    pub fn admin_locked(&self, ip: IpAddr, now: u64) -> bool {
+        self.admin_failures
+            .lock()
+            .expect("admin failures")
+            .get(&ip)
+            .is_some_and(|f| f.locked_until > now)
+    }
+
+    /// Clear failures after a successful admin auth.
+    pub fn admin_success(&self, ip: IpAddr) {
+        self.admin_failures
+            .lock()
+            .expect("admin failures")
+            .remove(&ip);
+    }
+
+    /// Record a failed admin auth. Returns true if this attempt locks the
+    /// address out.
+    pub fn note_admin_failure(&self, ip: IpAddr, now: u64) -> bool {
+        let max = self.config.limits.admin_max_failures.max(1);
+        let lock = self.config.limits.admin_lockout_ms;
+        let mut map = self.admin_failures.lock().expect("admin failures");
+        let entry = map.entry(ip).or_insert(AdminFail {
+            count: 0,
+            window_start: now,
+            locked_until: 0,
+        });
+        if now.saturating_sub(entry.window_start) > 60_000 {
+            entry.count = 0;
+            entry.window_start = now;
+        }
+        entry.count += 1;
+        if entry.count >= max {
+            entry.locked_until = now.saturating_add(lock);
+            entry.count = 0;
+            true
+        } else {
+            false
+        }
     }
 
     /// Borrowed handler context.

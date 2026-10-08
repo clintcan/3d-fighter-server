@@ -46,6 +46,9 @@ ws_read_buffer = 16384
 ws_write_buffer = 16384
 ws_max_write_buffer = 262144
 ws_pong_timeout_ms = 60000
+# Admin auth failures per address before a lockout, and the lockout length.
+admin_max_failures = 10
+admin_lockout_ms = 300000
 
 [admin]
 token_env = "FIGHTER_ADMIN_TOKEN"   # admin API enabled only if this variable is set
