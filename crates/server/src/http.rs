@@ -98,7 +98,7 @@ async fn rooms(State(state): State<AppState>) -> Response {
             .into_iter()
             .filter_map(|id| lobby.room_object(&id, None, true))
             .collect();
-        serde_json::json!({ "rooms": rooms }).to_string()
+        serde_json::json!({ "rooms": rooms, "online": lobby.online() }).to_string()
     };
     *state.rooms_cache.lock().expect("cache lock") = Some((now, body.clone()));
     (

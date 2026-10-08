@@ -179,9 +179,9 @@ host                                   server                                spe
 
 | type | Fields | Notes |
 |---|---|---|
-| `welcome` | `protocol: 1`, `session_id`, `resume_token`, `server_time: u64` (ms), `region`, `udp: {host, port}`, `limits: {...}` (section 10.2), `motd?: string`, `latest_game_version?: string`, `update_url?: string` | If the client's version is older than `latest_game_version`, the game shows an "update available" prompt. If below `min_game_version`, the server sends `error` with `version_unsupported` and closes instead. |
+| `welcome` | `protocol: 1`, `session_id`, `resume_token`, `server_time: u64` (ms), `region`, `udp: {host, port}`, `limits: {...}` (section 10.2), `online: {...}` (section 6.3.1), `motd?: string`, `latest_game_version?: string`, `update_url?: string` | If the client's version is older than `latest_game_version`, the game shows an "update available" prompt. If below `min_game_version`, the server sends `error` with `version_unsupported` and closes instead. |
 | `pong` | `t` (echoed), `server_time` | |
-| `rooms` | `rooms: [Room]`, `next_cursor?: string` | Room summary objects, section 6.4. |
+| `rooms` | `rooms: [Room]`, `online: {...}` (section 6.3.1), `next_cursor?: string` | Room summary objects, section 6.4. The game re-lists every 3 s while the lobby is open, so `online` stays fresh without a new message. |
 | `room_created` | `room: Room`, `code: string` | `code` is 6 characters from `ABCDEFGHJKMNPQRSTUVWXYZ23456789` (no 0/O/1/I/L), unique among live rooms. |
 | `join_pending` | `room_id` | To the guest while the host decides. |
 | `join_request` | `request_id`, `name`, `client_id_hash` (first 8 hex characters of SHA-256 of the client id, for "same person again" hints without revealing the id) | To the host. Only one pending request per room; others get `error` with `room_busy`. A request expires after **30 s** (`join_declined` with reason `timeout`). |
@@ -198,6 +198,26 @@ host                                   server                                spe
 | `queue_matched` | then `match_session` follows | Milestone 5. |
 | `server_notice` | `message`, `severity: "info" \| "warning"` | For example "Server restarts in 5 minutes". |
 | `error` | `code`, `message`, `rid?` | Codes in section 6.5. |
+
+#### 6.3.1 Online object
+
+An aggregate activity summary, shown to players in `welcome` and `rooms` (and in the
+public `GET /v1/rooms` JSON). Counts only: never names, ids or addresses.
+
+```json
+"online": { "players": 23, "in_match": 12, "spectating": 3, "rooms": 7 }
+```
+
+- `players`: live sessions that completed `hello` (a session held only for resume is
+  not counted).
+- `in_match`: players in a room whose `status` is `in_match`.
+- `spectating`: sessions currently spectating.
+- `rooms`: live rooms of any visibility (so unlisted/private activity is visible as
+  a count without revealing the rooms).
+
+The server keeps these as running counters, so building the object is O(1); it must
+not scan sessions per message. Exact counts are reported (no floor); see
+`docs/DECISIONS.md`.
 
 ### 6.4 Room object
 

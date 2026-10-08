@@ -214,6 +214,8 @@ pub struct Room {
     pub matches_played: u32,
     pub spectator_peak: u32,
     pub last_replay_ms: u64,
+    /// Players this room currently contributes to `online.in_match`.
+    pub in_match_counted: usize,
     dirty: bool,
     next_broadcast_ms: u64,
 }
@@ -246,6 +248,12 @@ pub struct Lobby {
     replay_tx: UnboundedSender<ReplayJob>,
     /// Running total of match-log bytes across all rooms, for the global budget.
     pub log_bytes: usize,
+    /// Aggregate lobby activity counters, maintained incrementally so `welcome`
+    /// and `list_rooms` are O(1) (issue #24).
+    pub online_players: usize,
+    pub online_in_match: usize,
+    pub online_spectating: usize,
+    pub online_rooms: usize,
     #[allow(dead_code)] // surfaced by admin/metrics in M5
     pub started_ms: u64,
     pub region: String,
@@ -279,6 +287,10 @@ impl Lobby {
             replays,
             replay_tx,
             log_bytes: 0,
+            online_players: 0,
+            online_in_match: 0,
+            online_spectating: 0,
+            online_rooms: 0,
             started_ms,
             region,
         }
@@ -313,6 +325,7 @@ impl Lobby {
     /// Register a new session and index its resume token.
     pub fn add_session(&mut self, session: Session) -> String {
         let id = session.id.clone();
+        self.online_players = self.online_players.saturating_add(1);
         self.resume_index
             .insert(session.resume_token.clone(), id.clone());
         self.sessions.insert(id.clone(), session);
@@ -323,6 +336,9 @@ impl Lobby {
     /// closes. The room, role and tokens are preserved.
     pub fn mark_disconnected(&mut self, sid: &str, now: u64) {
         if let Some(sess) = self.sessions.get_mut(sid) {
+            if sess.disconnected_at.is_none() {
+                self.online_players = self.online_players.saturating_sub(1);
+            }
             sess.out = None;
             sess.disconnected_at = Some(now);
         }
@@ -332,6 +348,42 @@ impl Lobby {
     pub fn touch(&mut self, sid: &str, now: u64) {
         if let Some(sess) = self.sessions.get_mut(sid) {
             sess.last_seen_ms = now;
+        }
+    }
+
+    /// The aggregate lobby activity object (issue #24). O(1): reads counters.
+    pub fn online(&self) -> proto::Online {
+        proto::Online {
+            players: self.online_players as u32,
+            in_match: self.online_in_match as u32,
+            spectating: self.online_spectating as u32,
+            rooms: self.online_rooms as u32,
+        }
+    }
+
+    /// Recompute a room's contribution to `online.in_match` after its status or
+    /// membership changed. Membership-based (independent of socket liveness).
+    fn sync_room_in_match(&mut self, room_id: &str) {
+        let desired = match self.rooms.get(room_id) {
+            Some(room) if room.status() == RoomStatus::InMatch => {
+                1 + u32::from(room.guest.is_some())
+            }
+            _ => 0,
+        } as usize;
+        let prev = match self.rooms.get(room_id) {
+            Some(room) => room.in_match_counted,
+            None => return,
+        };
+        if prev == desired {
+            return;
+        }
+        if let Some(room) = self.rooms.get_mut(room_id) {
+            room.in_match_counted = desired;
+        }
+        if desired >= prev {
+            self.online_in_match = self.online_in_match.saturating_add(desired - prev);
+        } else {
+            self.online_in_match = self.online_in_match.saturating_sub(prev - desired);
         }
     }
 
@@ -383,6 +435,7 @@ impl Lobby {
         let Lobby {
             sessions,
             resume_index,
+            online_players,
             ..
         } = self;
         let sid = resume_index.get(token).cloned()?;
@@ -399,6 +452,7 @@ impl Lobby {
         sess.content_hash = hello.content_hash;
         sess.relay_only = hello.relay_only.unwrap_or(false);
         sess.region = hello.region.clone();
+        *online_players = online_players.saturating_add(1);
         Some(sid)
     }
 
@@ -765,6 +819,7 @@ impl Lobby {
             sid,
             &ServerMessage::Rooms {
                 rooms: page,
+                online: Some(self.online()),
                 next_cursor,
             },
             rid,
@@ -920,11 +975,13 @@ impl Lobby {
             matches_played: 0,
             spectator_peak: 0,
             last_replay_ms: 0,
+            in_match_counted: 0,
             dirty: false,
             next_broadcast_ms: 0,
         };
         self.codes.insert(code.clone(), id.clone());
         self.rooms.insert(id.clone(), room);
+        self.online_rooms = self.online_rooms.saturating_add(1);
         if let Some(s) = self.sessions.get_mut(host) {
             s.room = Some(id.clone());
             s.role = Some(Role::Host);
@@ -1176,6 +1233,7 @@ impl Lobby {
             );
             ctx.metrics.joins.with_label_values(&["accepted"]).inc();
             self.update_room_metrics(ctx.metrics);
+            self.sync_room_in_match(&room_id);
 
             let udp = ctx.udp_info();
             self.send_rid(
@@ -1279,6 +1337,7 @@ impl Lobby {
         }
         ctx.metrics.joins.with_label_values(&["kicked"]).inc();
         self.update_room_metrics(ctx.metrics);
+        self.sync_room_in_match(&room_id);
         self.broadcast_room_state(&room_id);
     }
 
@@ -1344,6 +1403,7 @@ impl Lobby {
                 false
             }
         };
+        self.sync_room_in_match(&room_id);
         if should_broadcast {
             self.broadcast_room_state(&room_id);
         }
@@ -1435,6 +1495,7 @@ impl Lobby {
             s.spectator = Some(SpectatorState::default());
         }
         ctx.metrics.spectators.inc();
+        self.online_spectating = self.online_spectating.saturating_add(1);
         self.send_rid(
             sid,
             &ServerMessage::SpectateStarted {
@@ -1640,6 +1701,7 @@ impl Lobby {
             );
             ctx.metrics.joins.with_label_values(&["quick_match"]).inc();
             self.update_room_metrics(ctx.metrics);
+            self.sync_room_in_match(&room_id);
             let pair_secret = generate_hex_token(16);
             if let Some(room) = self.rooms.get_mut(&room_id) {
                 room.pair_secret = Some(pair_secret.clone());
@@ -1735,6 +1797,7 @@ impl Lobby {
         }
         ctx.metrics.spectators.set(self.total_spectators() as i64);
         self.update_room_metrics(ctx.metrics);
+        self.sync_room_in_match(room_id);
         self.broadcast_room_state(room_id);
     }
 
@@ -1753,6 +1816,7 @@ impl Lobby {
             s.spectator = None;
         }
         if removed {
+            self.online_spectating = self.online_spectating.saturating_sub(1);
             ctx.metrics.spectators.set(self.total_spectators() as i64);
             self.send(
                 sid,
@@ -1774,6 +1838,9 @@ impl Lobby {
         let Some(room) = self.rooms.remove(room_id) else {
             return;
         };
+        self.online_rooms = self.online_rooms.saturating_sub(1);
+        self.online_in_match = self.online_in_match.saturating_sub(room.in_match_counted);
+        self.online_spectating = self.online_spectating.saturating_sub(room.spectators.len());
         self.log_bytes = self.log_bytes.saturating_sub(room_log_bytes(&room));
         self.codes.remove(&room.code);
         self.bindings
@@ -1826,6 +1893,11 @@ impl Lobby {
         let Some(sess) = self.sessions.remove(sid) else {
             return;
         };
+        // A connected session leaves the live-player count; a lingering one was
+        // already removed from it at disconnect time.
+        if sess.disconnected_at.is_none() {
+            self.online_players = self.online_players.saturating_sub(1);
+        }
         self.resume_index.remove(&sess.resume_token);
         self.queue.retain(|q| q.session_id != sid);
         if let Some(out) = &sess.out {
@@ -2633,6 +2705,7 @@ pub fn welcome_message(
     now: u64,
     udp: UdpInfo,
     limits: proto::Limits,
+    online: proto::Online,
 ) -> ServerMessage {
     let older_than_latest = version_lt(&session.game_version, &config.game.latest_game_version);
     ServerMessage::Welcome {
@@ -2643,6 +2716,7 @@ pub fn welcome_message(
         region: config.server.region.clone(),
         udp,
         limits,
+        online: Some(online),
         motd: config.game.motd.clone(),
         latest_game_version: if older_than_latest {
             Some(config.game.latest_game_version.clone())

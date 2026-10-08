@@ -9,7 +9,7 @@ use common::{http_request, pair_up, start_test, start_with, test_config, Client,
 use fighter_protocol::feed::{FeedFrame, MatchStart};
 use fighter_protocol::udp::{BindRole, UdpDatagram};
 use futures_util::{SinkExt, StreamExt};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use tokio_tungstenite::connect_async;
@@ -564,4 +564,81 @@ async fn lobby_stays_responsive_during_relay_burst() {
 
     burst.await.ok();
     drain.abort();
+}
+
+// #24: the aggregate online object tracks state across the lobby lifecycle.
+#[tokio::test]
+async fn online_counts_track_state() {
+    let mut config = test_config();
+    config.limits.list_rooms_per_second = 1000; // many list_rooms calls in the test
+    let (running, clock) = start_with(config).await;
+    let url = running.ws_url();
+    let hello = |cid: &str| {
+        json!({
+            "type":"hello","protocol":1,"game_version":"0.4.1","content_hash":111,
+            "client_id":cid,"name":"P"
+        })
+    };
+    async fn online(c: &mut Client) -> Value {
+        c.send(json!({"type":"list_rooms"})).await;
+        c.recv_type("rooms").await["online"].clone()
+    }
+
+    let mut host = Client::hello_raw(&url, hello("h")).await;
+    let welcome = host.recv_type("welcome").await;
+    assert_eq!(welcome["online"]["players"], 1);
+    assert_eq!(welcome["online"]["rooms"], 0);
+
+    let mut guest = Client::hello_raw(&url, hello("g")).await;
+    guest.recv_type("welcome").await;
+    assert_eq!(online(&mut host).await["players"], 2);
+
+    host.send(json!({"type":"create_room","visibility":"public","allow_spectators":true}))
+        .await;
+    let code = host.recv_type("room_created").await["code"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    guest.send(json!({"type":"join_room","room":code})).await;
+    guest.recv_type("join_pending").await;
+    let request = host.recv_type("join_request").await;
+    host.send(json!({
+        "type":"answer_join","request_id":request["request_id"],"accept":true
+    }))
+    .await;
+    host.recv_type("match_session").await;
+    guest.recv_type("match_session").await;
+
+    let o = online(&mut host).await;
+    assert_eq!(o["rooms"], 1);
+    assert_eq!(o["players"], 2);
+    assert_eq!(o["in_match"], 0); // still in the lobby phase
+
+    host.send(json!({"type":"room_update","phase":"in_match"}))
+        .await;
+    assert_eq!(online(&mut host).await["in_match"], 2);
+
+    let mut spec = Client::hello_raw(&url, hello("s")).await;
+    spec.recv_type("welcome").await;
+    spec.send(json!({"type":"spectate","room":code})).await;
+    spec.recv_type("spectate_started").await;
+    let o = online(&mut host).await;
+    assert_eq!(o["spectating"], 1);
+    assert_eq!(o["players"], 3);
+
+    // Guest's socket drops: players drops at once; in_match keeps the room
+    // membership during the resume grace.
+    drop(guest);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let o = online(&mut host).await;
+    assert_eq!(o["players"], 2);
+    assert_eq!(o["in_match"], 2);
+
+    // After the grace the guest is removed and the room returns to the lobby.
+    clock.advance(31_000);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let o = online(&mut host).await;
+    assert_eq!(o["in_match"], 0);
+    assert_eq!(o["players"], 2);
+    assert_eq!(o["spectating"], 1);
 }

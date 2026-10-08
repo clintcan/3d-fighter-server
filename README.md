@@ -16,7 +16,8 @@ implements it milestone by milestone (section 12).
   `cancel_join` with timeout and decline cooldown, `kick`, `leave_room`,
   `room_update` → coalesced `room_state`, host-leave closes the room, idle
   room expiry, `/healthz`, `/metrics`, `/v1/rooms`, config file + env
-  overrides, structured logging, Docker image.
+  overrides, structured logging, Docker image. `welcome` and `rooms` also carry
+  an aggregate `online` object (`players`/`in_match`/`spectating`/`rooms`).
 - **M2 — Connection brokering:** implemented. UDP `BIND`/`BOUND` with endpoint
   tracking, keepalive and 60 s expiry; `peer_endpoints` with `punch_at` and
   same-public-IP LAN detection; relay with source-address check, per-player

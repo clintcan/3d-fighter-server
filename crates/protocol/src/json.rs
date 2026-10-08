@@ -193,6 +193,20 @@ pub struct Limits {
     pub reaction_interval_ms: u64,
 }
 
+/// Aggregate lobby activity, shown to players in `welcome` and `rooms`
+/// (section 6.3). Counts only, never identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Online {
+    /// Live sessions that completed `hello` (not sessions held only for resume).
+    pub players: u32,
+    /// Players in a room whose status is `in_match`.
+    pub in_match: u32,
+    /// Sessions currently spectating.
+    pub spectating: u32,
+    /// Live rooms of any visibility.
+    pub rooms: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Candidate {
     pub ip: String,
@@ -481,6 +495,8 @@ pub enum ServerMessage {
         udp: UdpInfo,
         limits: Limits,
         #[serde(skip_serializing_if = "Option::is_none")]
+        online: Option<Online>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         motd: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         latest_game_version: Option<String>,
@@ -493,6 +509,8 @@ pub enum ServerMessage {
     },
     Rooms {
         rooms: Vec<Room>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        online: Option<Online>,
         #[serde(skip_serializing_if = "Option::is_none")]
         next_cursor: Option<String>,
     },
@@ -626,6 +644,21 @@ mod tests {
         let v = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["type"], "pong");
         assert_eq!(v["t"], 5);
+    }
+
+    #[test]
+    fn online_serializes_with_counts() {
+        let v = serde_json::to_value(Online {
+            players: 23,
+            in_match: 12,
+            spectating: 3,
+            rooms: 7,
+        })
+        .unwrap();
+        assert_eq!(v["players"], 23);
+        assert_eq!(v["in_match"], 12);
+        assert_eq!(v["spectating"], 3);
+        assert_eq!(v["rooms"], 7);
     }
 
     #[test]

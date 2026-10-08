@@ -261,6 +261,16 @@ bottom.
   the same public IP cannot win the race. It is never logged or placed in
   `room_state`, `peer_endpoints` or metrics, and is cleared when the guest leaves
   so the next match gets a fresh one.
+- **The lobby reports aggregate `online` counts (issue #24).** `welcome` and
+  `rooms` carry `{players, in_match, spectating, rooms}`, maintained as O(1)
+  running counters (updated on connect/disconnect/resume, room create/close,
+  match start/end and spectate start/stop) rather than scanning sessions per
+  message. `players` counts live sockets only; `in_match` and `spectating` are
+  membership-based and persist through the 30 s resume grace. Counts only, never
+  identities. **Exact counts are reported, with no floor:** the lobby's purpose is
+  to show activity, the count is already implied by the public room list, and a
+  floor returning a string would complicate the contract; operators who want to
+  hide small numbers can round them client-side.
 
 ## Performance (load-test review)
 

@@ -297,7 +297,14 @@ async fn handle_socket(
         let lobby = state.lobby.lock().expect("lobby lock");
         let welcome = {
             let session = &lobby.sessions[&sid];
-            welcome_message(session, &state.config, now, ctx.udp_info(), ctx.limits())
+            welcome_message(
+                session,
+                &state.config,
+                now,
+                ctx.udp_info(),
+                ctx.limits(),
+                lobby.online(),
+            )
         };
         lobby.send(&sid, &welcome);
         if let Some(room_id) = lobby.sessions[&sid].room.clone() {
