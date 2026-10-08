@@ -96,6 +96,9 @@ pub struct Session {
     pub role: Option<Role>,
     pub last_seen_ms: u64,
     pub disconnected_at: Option<u64>,
+    /// The WebSocket connection that currently owns this session. A resumed
+    /// connection takes it over; the old handler must not tear it down (#25).
+    pub conn_id: u64,
     pub resume_token: String,
     pub session_token: [u8; 16],
     pub relay_key: [u8; 8],
@@ -120,6 +123,7 @@ impl Session {
         relay_only: bool,
         region: Option<String>,
         client_ip: std::net::IpAddr,
+        conn_id: u64,
         out: UnboundedSender<OutMsg>,
         queued_bytes: Arc<AtomicUsize>,
         now: u64,
@@ -141,6 +145,7 @@ impl Session {
             role: None,
             last_seen_ms: now,
             disconnected_at: None,
+            conn_id,
             resume_token: generate_hex_token(16),
             session_token: generate_bytes::<16>(),
             relay_key: generate_bytes::<8>(),
@@ -333,15 +338,22 @@ impl Lobby {
     }
 
     /// Keep a session alive for the reconnect grace period after its socket
-    /// closes. The room, role and tokens are preserved.
-    pub fn mark_disconnected(&mut self, sid: &str, now: u64) {
-        if let Some(sess) = self.sessions.get_mut(sid) {
-            if sess.disconnected_at.is_none() {
-                self.online_players = self.online_players.saturating_sub(1);
-            }
-            sess.out = None;
-            sess.disconnected_at = Some(now);
+    /// closes. The room, role and tokens are preserved. Only acts if the session
+    /// is still owned by `conn_id`, so a stale handler cannot tear down a session
+    /// a resumed connection has taken over (#25). Returns whether it acted.
+    pub fn mark_disconnected(&mut self, sid: &str, conn_id: u64, now: u64) -> bool {
+        let Some(sess) = self.sessions.get_mut(sid) else {
+            return false;
+        };
+        if sess.conn_id != conn_id {
+            return false;
         }
+        if sess.disconnected_at.is_none() {
+            self.online_players = self.online_players.saturating_sub(1);
+        }
+        sess.out = None;
+        sess.disconnected_at = Some(now);
+        true
     }
 
     /// Record any frame received from a client as activity (section 6.1).
@@ -428,6 +440,7 @@ impl Lobby {
         &mut self,
         token: &str,
         out: UnboundedSender<OutMsg>,
+        conn_id: u64,
         queued_bytes: Arc<AtomicUsize>,
         now: u64,
         hello: &proto::Hello,
@@ -443,7 +456,14 @@ impl Lobby {
         resume_index.remove(token);
         sess.resume_token = generate_hex_token(16);
         resume_index.insert(sess.resume_token.clone(), sid.clone());
+        // If the old socket is still open, tell it to go away so it does not
+        // linger; the new connection takes the session over (#25).
+        if let Some(old) = &sess.out {
+            let _ = old.send(OutMsg::Close(4001, "resumed elsewhere".into()));
+        }
+        let was_disconnected = sess.disconnected_at.is_some();
         sess.out = Some(out);
+        sess.conn_id = conn_id;
         sess.queued_bytes = queued_bytes;
         sess.disconnected_at = None;
         sess.last_seen_ms = now;
@@ -452,7 +472,10 @@ impl Lobby {
         sess.content_hash = hello.content_hash;
         sess.relay_only = hello.relay_only.unwrap_or(false);
         sess.region = hello.region.clone();
-        *online_players = online_players.saturating_add(1);
+        // A live -> live takeover does not change the live-player count.
+        if was_disconnected {
+            *online_players = online_players.saturating_add(1);
+        }
         Some(sid)
     }
 
@@ -2601,17 +2624,17 @@ impl Lobby {
 
         // Sessions silent past the timeout are treated as disconnected and get
         // the reconnect grace period before their membership is torn down.
-        let silent: Vec<String> = self
+        let silent: Vec<(String, u64)> = self
             .sessions
             .values()
             .filter(|s| {
                 s.disconnected_at.is_none()
                     && now.saturating_sub(s.last_seen_ms) > ctx.config.limits.session_silent_ms
             })
-            .map(|s| s.id.clone())
+            .map(|s| (s.id.clone(), s.conn_id))
             .collect();
-        for sid in silent {
-            self.mark_disconnected(&sid, now);
+        for (sid, conn_id) in silent {
+            self.mark_disconnected(&sid, conn_id, now);
         }
 
         // Disconnected sessions past the grace period are removed for real.
@@ -2766,6 +2789,7 @@ mod tests {
             false,
             None,
             "127.0.0.1".parse().unwrap(),
+            0,
             tx,
             Arc::new(AtomicUsize::new(0)),
             now,

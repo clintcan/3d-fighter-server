@@ -1,7 +1,7 @@
 //! WebSocket lobby transport (`GET /v1/ws`).
 
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +26,10 @@ use crate::proxy::{resolve_client_ip, strike_ip};
 const SUBPROTOCOL: &str = "3dfighter.lobby.v1";
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Monotonic id for each accepted WebSocket connection, so a stale handler can
+/// tell whether it still owns a session a resumed connection took over (#25).
+static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
 fn has_subprotocol(headers: &HeaderMap) -> bool {
     headers
@@ -64,6 +68,7 @@ pub async fn ws_handler(
         return (StatusCode::SERVICE_UNAVAILABLE, "server full").into_response();
     }
     state.metrics.connections_total.inc();
+    let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
     ws.max_message_size(MAX_BINARY_FRAME)
         .max_frame_size(MAX_BINARY_FRAME)
         // Small per-connection buffers cut idle memory (issue #20).
@@ -72,7 +77,7 @@ pub async fn ws_handler(
         .max_write_buffer_size(state.config.limits.ws_max_write_buffer)
         .protocols([SUBPROTOCOL])
         .on_upgrade(move |socket| async move {
-            handle_socket(socket, state.clone(), client_ip, strike).await;
+            handle_socket(socket, state.clone(), client_ip, strike, conn_id).await;
             state.release_conn(client_ip);
         })
 }
@@ -100,12 +105,27 @@ async fn read_hello(stream: &mut SplitStream<WebSocket>) -> Option<proto::Hello>
 }
 
 /// Record a malformed/oversized message as a strike. Returns true if the
-/// connection must be closed (too many strikes, or now banned).
-fn handle_strike(state: &AppState, sid: &str, strike: Option<IpAddr>, message: &str) -> bool {
-    state.metrics.malformed.inc();
+/// connection must be closed (too many strikes, now banned, or the session was
+/// taken over by a resumed connection).
+fn handle_strike(
+    state: &AppState,
+    sid: &str,
+    conn_id: u64,
+    strike: Option<IpAddr>,
+    message: &str,
+) -> bool {
     let ctx = state.ctx();
     let now = state.clock.now_ms();
     let mut lobby = state.lobby.lock().expect("lobby lock");
+    if lobby
+        .sessions
+        .get(sid)
+        .map(|s| s.conn_id != conn_id)
+        .unwrap_or(true)
+    {
+        return true; // stale connection; do not touch the resumed session
+    }
+    state.metrics.malformed.inc();
     lobby.send_error(sid, ErrorCode::BadMessage, message, None);
     let hash = lobby.sessions.get(sid).map(|s| s.client_id_hash.clone());
     let banned = lobby.bans.record(hash.as_deref(), strike, now);
@@ -139,6 +159,7 @@ async fn handle_socket(
     state: AppState,
     client_ip: IpAddr,
     strike: Option<IpAddr>,
+    conn_id: u64,
 ) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<OutMsg>();
@@ -257,7 +278,14 @@ async fn handle_socket(
     let sid = {
         let resumed = if let Some(token) = hello.resume_token.clone() {
             let mut lobby = state.lobby.lock().expect("lobby lock");
-            lobby.try_resume(&token, tx.clone(), queued_bytes.clone(), now, &hello)
+            lobby.try_resume(
+                &token,
+                tx.clone(),
+                conn_id,
+                queued_bytes.clone(),
+                now,
+                &hello,
+            )
         } else {
             None
         };
@@ -278,6 +306,7 @@ async fn handle_socket(
                     hello.relay_only.unwrap_or(false),
                     hello.region.clone(),
                     client_ip,
+                    conn_id,
                     tx,
                     queued_bytes,
                     now,
@@ -338,12 +367,26 @@ async fn handle_socket(
         let Some(incoming) = incoming else {
             break;
         };
+        // If a resumed connection took this session over, stop: this handler no
+        // longer owns it and must not act on it (#25).
+        {
+            let lobby = state.lobby.lock().expect("lobby lock");
+            if lobby
+                .sessions
+                .get(&sid)
+                .map(|s| s.conn_id != conn_id)
+                .unwrap_or(true)
+            {
+                tracing::debug!(session_id = %sid, "session taken over; closing old connection");
+                break;
+            }
+        }
         match incoming {
             Ok(Message::Text(t)) => {
                 // Text frames are capped at 8 KiB by the spec; reject before
                 // parsing so an oversized frame is never buffered as JSON.
                 if t.len() > MAX_TEXT_FRAME {
-                    if handle_strike(&state, &sid, strike, "text frame too large") {
+                    if handle_strike(&state, &sid, conn_id, strike, "text frame too large") {
                         break;
                     }
                     continue;
@@ -362,7 +405,7 @@ async fn handle_socket(
                         continue;
                     }
                     Err(ClientParseError::BadMessage) => {
-                        if handle_strike(&state, &sid, strike, "malformed message") {
+                        if handle_strike(&state, &sid, conn_id, strike, "malformed message") {
                             break;
                         }
                         continue;
@@ -424,9 +467,9 @@ async fn handle_socket(
 
     {
         // Keep the session for the reconnect grace period instead of tearing it
-        // down immediately.
+        // down immediately. Only if this connection still owns it (#25).
         let mut lobby = state.lobby.lock().expect("lobby lock");
-        lobby.mark_disconnected(&sid, state.clock.now_ms());
+        lobby.mark_disconnected(&sid, conn_id, state.clock.now_ms());
     }
     writer.await.ok();
     tracing::info!(session_id = %sid, "session socket closed");

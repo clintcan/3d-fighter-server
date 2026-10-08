@@ -642,3 +642,54 @@ async fn online_counts_track_state() {
     assert_eq!(o["players"], 2);
     assert_eq!(o["spectating"], 1);
 }
+
+// #25: resuming over a still-open socket must not let the old handler tear down
+// the resumed connection, and must not leak online.players.
+#[tokio::test]
+async fn resume_over_live_socket_takes_over() {
+    let mut config = test_config();
+    config.limits.list_rooms_per_second = 1000;
+    let (running, clock) = start_with(config).await;
+    let url = running.ws_url();
+
+    async fn online_of(c: &mut Client) -> Value {
+        c.send(json!({"type":"list_rooms"})).await;
+        c.recv_type("rooms").await["online"].clone()
+    }
+    let hello = |cid: &str, resume: Option<&str>| {
+        json!({
+            "type":"hello","protocol":1,"game_version":"0.4.1","content_hash":111,
+            "client_id":cid,"name":"P","resume_token":resume
+        })
+    };
+
+    let mut watcher = Client::connect(&url, "W", "0.4.1", 111).await;
+    let mut a = Client::hello_raw(&url, hello("a", None)).await;
+    let wa = a.recv_type("welcome").await;
+    let token = wa["resume_token"].as_str().unwrap().to_string();
+    let a_sid = wa["session_id"].as_str().unwrap().to_string();
+
+    // B resumes while A's socket is still open.
+    let mut b = Client::hello_raw(&url, hello("b", Some(&token))).await;
+    let wb = b.recv_type("welcome").await;
+    assert_eq!(wb["session_id"], a_sid.as_str());
+
+    // Two live people (watcher + the single session), not three.
+    assert_eq!(online_of(&mut watcher).await["players"], 2);
+
+    // A's old socket goes away; its stale handler must not close B.
+    drop(a);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    b.send(json!({"type":"ping","t":1})).await;
+    let pong = timeout(Duration::from_secs(2), b.recv_type("pong"))
+        .await
+        .expect("B stays connected after the old socket closes");
+    assert_eq!(pong["t"], 1);
+    assert_eq!(online_of(&mut watcher).await["players"], 2);
+
+    // B disconnects; after the grace the count returns to the baseline.
+    drop(b);
+    clock.advance(31_000);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(online_of(&mut watcher).await["players"], 1);
+}

@@ -256,7 +256,7 @@ not scan sessions per message. Exact counts are reported (no floor); see
 `bad_message`, `unknown_type`, `not_allowed` (wrong role or state), `version_unsupported`, `version_mismatch` (room needs a different game version or data), `room_not_found`, `room_full`, `room_busy` (a join request is already pending), `wrong_password`, `spectating_disabled`, `spectators_full`, `rate_limited`, `name_invalid`, `already_in_room`, `server_full`, `internal`.
 
 ### 6.6 Reconnection
-If a WebSocket drops, the server keeps the client's session (room membership, role, spectating) for **30 s**. A new connection whose `hello` carries the old `resume_token` takes it over and gets `welcome` with the same `session_id`, followed by the current `room_state`. A host reconnecting mid-match keeps publishing the feed from the next tick it has; a gap in the feed is handled as in section 8.3. After 30 s the session ends as a `disconnected` leave.
+If a WebSocket drops, the server keeps the client's session (room membership, role, spectating) for **30 s**. A new connection whose `hello` carries the old `resume_token` takes it over and gets `welcome` with the same `session_id`, followed by the current `room_state`. If the old socket is still open (common behind a proxy), the server closes it (`4001`, "resumed elsewhere") and ignores any later teardown from that stale connection. A host reconnecting mid-match keeps publishing the feed from the next tick it has; a gap in the feed is handled as in section 8.3. After 30 s the session ends as a `disconnected` leave.
 
 ---
 

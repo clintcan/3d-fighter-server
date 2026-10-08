@@ -271,6 +271,16 @@ bottom.
   to show activity, the count is already implied by the public room list, and a
   floor returning a string would complicate the contract; operators who want to
   hide small numbers can round them client-side.
+- **Each WebSocket connection has an id and only tears down the session it owns
+  (issue #25).** When a client reconnects with its `resume_token` while the server
+  still holds the old socket open (the normal case behind a proxy, since the old
+  socket lingers until the pong/idle timeout), the new connection takes the session
+  over: `try_resume` sends `Close(4001, "resumed elsewhere")` on the old sender and
+  records the new `conn_id`. The old handler's later `mark_disconnected` (and its
+  malformed/ban teardown) is a no-op because the session is no longer owned by it,
+  so it cannot close the resumed connection. `try_resume` also increments
+  `online.players` only when the session was actually disconnected, so a live →
+  live takeover does not double-count.
 
 ## Performance (load-test review)
 
