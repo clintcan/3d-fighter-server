@@ -148,8 +148,9 @@ bottom.
 - **The blocklist lives in `[moderation].blocklist`.** It is applied to player
   names and room names and rejects with `name_invalid`; the default list is empty.
 - **Relay latency is measured from UDP receive to send completion.** Exposed as the
-  `fighter_relay_latency_seconds` histogram so the p99 target is verifiable from
-  `/metrics`; the measured p99 is under 0.5 ms (see `docs/LOAD-TEST.md`).
+  `fighter_relay_latency_seconds` histogram (sampled 1 in 64) so the target is
+  verifiable from `/metrics`; see `docs/LOAD-TEST.md` for measured relay latency
+  and capacity.
 - **Graceful shutdown sends a notice, then drains matches up to 60 s.** New
   connections are refused while draining; the wait is bounded by
   `limits.shutdown_grace_ms` so shutdown always completes.

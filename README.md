@@ -118,13 +118,17 @@ cargo build --release --bin fighter-server --bin client-sim
 scripts/demo.sh
 ```
 
-Load test (see [`docs/LOAD-TEST.md`](docs/LOAD-TEST.md)):
+A quick in-repo smoke load (not a capacity benchmark):
 
 ```sh
 FIGHTER__LIMITS__MAX_CONNECTIONS_PER_IP=5000 \
   cargo run --release --bin fighter-server &
 cargo run --release --bin client-sim -- load --matches 100 --spectators 200 --duration 10
 ```
+
+The full load and stress results — per-unit CPU/memory costs, capacity on the
+production droplet (about 400 direct or 110 relayed matches on 1 vCPU / 512 MB),
+and the issue history — are in [`docs/LOAD-TEST.md`](docs/LOAD-TEST.md).
 
 Fuzzing (requires nightly and `cargo-fuzz`):
 
