@@ -856,3 +856,53 @@ async fn security_headers_present() {
         "missing no-store on /admin: {admin}"
     );
 }
+
+// #28: admin_ban normalises the IP with key_ip so the ban actually matches.
+#[tokio::test]
+async fn admin_ban_normalises_ip() {
+    let mut config = test_config();
+    config.admin.token = Some("secret-token".into());
+    config.server.trusted_proxies = vec!["127.0.0.1".into()];
+    let (running, _clock) = start_with(config).await;
+    let url = running.ws_url();
+    let hello = |cid: &str| {
+        json!({
+            "type":"hello","protocol":1,"game_version":"0.4.1","content_hash":111,
+            "client_id":cid,"name":"P"
+        })
+    };
+    let ban = |body: &'static str| {
+        let addr = running.addr;
+        async move {
+            http_request(
+                addr,
+                "POST",
+                "/admin/ban",
+                &[
+                    ("Authorization", "Bearer secret-token"),
+                    ("Content-Type", "application/json"),
+                ],
+                body,
+            )
+            .await
+        }
+    };
+
+    // A ban on one address in a /64 covers the whole /64.
+    assert_eq!(ban(r#"{"ip":"2001:db8::1234","minutes":10}"#).await.0, 200);
+    let mut a =
+        Client::hello_raw_with(&url, hello("v6"), &[("x-forwarded-for", "2001:db8::abcd")]).await;
+    assert_eq!(a.recv().await["code"], "not_allowed");
+
+    // An IPv4-mapped ban matches the plain IPv4 client.
+    assert_eq!(
+        ban(r#"{"ip":"::ffff:203.0.113.5","minutes":10}"#).await.0,
+        200
+    );
+    let mut b =
+        Client::hello_raw_with(&url, hello("v4"), &[("x-forwarded-for", "203.0.113.5")]).await;
+    assert_eq!(b.recv().await["code"], "not_allowed");
+
+    // An unparseable address is rejected, not silently ignored.
+    assert_eq!(ban(r#"{"ip":"not-an-ip","minutes":10}"#).await.0, 400);
+}

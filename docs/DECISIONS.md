@@ -296,7 +296,10 @@ bottom.
   (`key_ip`), and IPv4-mapped IPv6 addresses are treated as IPv4, so an IPv6 client
   cannot dodge limits by rotating within its /64. Trusted-proxy entries accept
   IPv6 CIDR too. All HTTP responses carry `X-Content-Type-Options: nosniff`, and
-  `/admin/*` carries `Cache-Control: no-store`.
+  `/admin/*` carries `Cache-Control: no-store`. Follow-ups (issue #28): `admin_ban`
+  normalises the target IP with `key_ip` (and rejects an unparseable one with 400)
+  so a ban actually matches, and the admin-failure map is pruned in the janitor
+  (expired lockouts and stale windows dropped, capped at `max_rate_limit_sources`).
 
 ## Performance (load-test review)
 

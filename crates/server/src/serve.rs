@@ -178,9 +178,13 @@ async fn janitor(state: AppState) {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        let ctx = state.ctx();
-        let mut lobby = state.lobby.lock().expect("lobby lock");
-        lobby.sweep(&ctx);
+        let now = state.clock.now_ms();
+        {
+            let ctx = state.ctx();
+            let mut lobby = state.lobby.lock().expect("lobby lock");
+            lobby.sweep(&ctx);
+        }
+        state.sweep_admin_failures(now);
     }
 }
 

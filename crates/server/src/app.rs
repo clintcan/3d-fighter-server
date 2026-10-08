@@ -149,6 +149,23 @@ impl AppState {
         }
     }
 
+    /// Drop expired/old admin-auth entries so the map stays bounded (issue #28).
+    pub fn sweep_admin_failures(&self, now: u64) {
+        let cap = self.config.limits.max_rate_limit_sources;
+        let mut map = self.admin_failures.lock().expect("admin failures");
+        map.retain(|_, f| f.locked_until > now || now.saturating_sub(f.window_start) <= 60_000);
+        while map.len() > cap {
+            let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, f)| f.window_start)
+                .map(|(k, _)| *k)
+            else {
+                break;
+            };
+            map.remove(&oldest);
+        }
+    }
+
     /// Borrowed handler context.
     pub fn ctx(&self) -> Ctx<'_> {
         Ctx {
@@ -201,5 +218,24 @@ impl AppState {
         drop(per_ip);
         let prev = self.conn_total.fetch_sub(1, Ordering::SeqCst);
         self.metrics.connections.set(prev.saturating_sub(1) as i64);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fighter_protocol::clock::TestClock;
+
+    #[test]
+    fn admin_failures_are_swept() {
+        let mut config = Config::default();
+        config.admin.token = Some("t".into());
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let state = AppState::new(config, clock, 0);
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        state.note_admin_failure(ip, 1_000_000);
+        assert!(state.admin_failures.lock().expect("map").contains_key(&ip));
+        state.sweep_admin_failures(1_061_000);
+        assert!(!state.admin_failures.lock().expect("map").contains_key(&ip));
     }
 }

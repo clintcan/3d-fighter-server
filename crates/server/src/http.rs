@@ -330,7 +330,14 @@ async fn admin_ban(
     }
     let minutes = body["minutes"].as_u64().unwrap_or(10);
     let hash = body["client_id_hash"].as_str();
-    let ip: Option<IpAddr> = body["ip"].as_str().and_then(|s| s.parse().ok());
+    // Normalise like client addresses are, so the ban actually matches (#28).
+    let ip: Option<IpAddr> = match body["ip"].as_str() {
+        Some(s) => match s.parse::<IpAddr>() {
+            Ok(ip) => Some(crate::proxy::key_ip(ip)),
+            Err(_) => return (StatusCode::BAD_REQUEST, "invalid ip").into_response(),
+        },
+        None => None,
+    };
     let now = state.clock.now_ms();
     tracing::info!(
         client = %admin_client_ip(&state, &headers, peer.ip()),
